@@ -33,6 +33,12 @@ def _agent_kwargs(
         pairs.append(("checkpoint_dir", str(checkpoint.resolve())))
     if action is not None:
         pairs.append(("budget_ratio", str(action.budget_ratio)))
+        pairs.append(
+            (
+                "require_budget_observation",
+                "false" if getattr(args, "allow_unverified_budget", False) else "true",
+            )
+        )
 
     result: list[str] = []
     for key, value in pairs:
@@ -105,6 +111,7 @@ def run_branch(args: argparse.Namespace) -> int:
         "source_step_name": manifest.step_name,
         "has_native_pi_history": bool(manifest.pi_checkpoint_session),
         "action": action.as_runtime_payload(),
+        "require_budget_observation": not args.allow_unverified_budget,
         "branch_task": str(branch_task),
         "jobs_dir": str(jobs_dir),
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -183,6 +190,14 @@ def build_parser() -> argparse.ArgumentParser:
     branch.add_argument("--budget-ratio", required=True, type=float)
     branch.add_argument("--output-root", default="branch_runs")
     branch.add_argument("--run-id")
+    branch.add_argument(
+        "--allow-unverified-budget",
+        action="store_true",
+        help=(
+            "Do not fail when TDAI does not emit a realized budget observation. "
+            "Use only while wiring the integration, never for training-data collection."
+        ),
+    )
     branch.set_defaults(func=run_branch)
     return parser
 
