@@ -8,7 +8,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from harbor.agents.base import BaseAgent
-from harbor.agents.capabilities import AgentCapabilities
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
@@ -30,11 +29,27 @@ _TDAI_ENV_KEYS = (
     "TDAI_MEMORY_RESERVE_TOKENS",
 )
 
+_PI_ENV_KEYS = (
+    "CUSTOM_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "PI_CODING_AGENT_DIR",
+)
+
+_NVM_INSTALL = (
+    'curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.2/install.sh | env -u NODE_VERSION bash && '
+    'export NVM_DIR="$HOME/.nvm" && '
+    '. "$NVM_DIR/nvm.sh" || true && '
+    "command -v nvm >/dev/null || { echo 'Error: NVM failed to load' >&2; exit 1; } && "
+    "nvm install 22 && nvm alias default 22 && npm -v"
+)
+
 
 class PiTdaiBranchAgent(BaseAgent):
     """Pi + TDAI + Harbor agent with pre-action checkpoints and frozen recall."""
 
-    capabilities = AgentCapabilities(resume=True)
+    SUPPORTS_RESUME = True
 
     @staticmethod
     def name() -> str:
@@ -86,10 +101,117 @@ class PiTdaiBranchAgent(BaseAgent):
         return self.environment_logs_dir / "budget-observation.json"
 
     def _tdai_env(self) -> dict[str, str]:
-        return {key: value for key in _TDAI_ENV_KEYS if (value := os.environ.get(key))}
+        env = {key: value for key in _TDAI_ENV_KEYS if (value := os.environ.get(key))}
+        proxy = env.get("TDAI_PROXY_URL") or "http://host.docker.internal:8096"
+        if "127.0.0.1" in proxy or "localhost" in proxy:
+            proxy = proxy.replace("127.0.0.1", "host.docker.internal").replace(
+                "localhost", "host.docker.internal"
+            )
+        env["TDAI_PROXY_URL"] = proxy
+        return env
+
+    def _container_url(self, url: str, *, loopback: str) -> str:
+        if "127.0.0.1" in url or "localhost" in url:
+            return url.replace("127.0.0.1", loopback).replace("localhost", loopback)
+        return url
+
+    def _pi_env(self) -> dict[str, str]:
+        env = {key: value for key in _PI_ENV_KEYS if (value := os.environ.get(key))}
+        if "CUSTOM_API_KEY" in env and "OPENAI_API_KEY" not in env:
+            env["OPENAI_API_KEY"] = env["CUSTOM_API_KEY"]
+        if "OPENAI_BASE_URL" not in env and os.environ.get("OPENAI_API_BASE"):
+            env["OPENAI_BASE_URL"] = os.environ["OPENAI_API_BASE"]
+        if "OPENAI_BASE_URL" in env:
+            env["OPENAI_BASE_URL"] = self._container_url(
+                env["OPENAI_BASE_URL"], loopback="host.docker.internal"
+            )
+        if "OPENAI_API_BASE" in env:
+            env["OPENAI_API_BASE"] = self._container_url(
+                env["OPENAI_API_BASE"], loopback="host.docker.internal"
+            )
+        return env
+
+    def _runtime_env(self) -> dict[str, str]:
+        return {**self._pi_env(), **self._tdai_env()}
+
+    async def _ensure_pi(self, environment: BaseEnvironment) -> None:
+        check = await environment.exec(
+            'bash -lc \'export NVM_DIR="$HOME/.nvm"; '
+            '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
+            "command -v pi >/dev/null'"
+        )
+        if check.return_code == 0:
+            return
+        install = await environment.exec(
+            "bash -lc "
+            + shlex.quote(
+                "set -euo pipefail; "
+                + _NVM_INSTALL
+                + " && npm install -g --ignore-scripts @mariozechner/pi-coding-agent@0.73.1 && pi --version"
+            )
+        )
+        if install.return_code != 0:
+            raise RuntimeError(
+                "failed to install Pi in Harbor environment: "
+                + ((install.stderr or install.stdout or "")[-2000:])
+            )
+
+    async def _write_pi_models(self, environment: BaseEnvironment) -> None:
+        # Optional smoke-test provider (`--model cpa/<id>`). The TDAI memory
+        # path uses `--model tdai/<id>` from the Pi plugin and does not need
+        # this file. Skip rather than bake a machine-local proxy URL.
+        base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
+        model_id = os.environ.get("CPA_MODEL") or os.environ.get("TDAI_MODEL")
+        if not base_url or not model_id:
+            return
+        if "127.0.0.1" in base_url or "localhost" in base_url:
+            base_url = (
+                base_url.replace("127.0.0.1", "host.docker.internal").replace(
+                    "localhost", "host.docker.internal"
+                )
+            )
+        models = {
+            "providers": {
+                "cpa": {
+                    "baseUrl": base_url,
+                    "api": "openai-responses",
+                    # Pi resolves this via process.env[value], so it must be a bare
+                    # env var name -- "$CUSTOM_API_KEY" would fall through as a literal.
+                    "apiKey": "CUSTOM_API_KEY",
+                    "authHeader": True,
+                    "models": [
+                        {
+                            "id": model_id,
+                            "name": model_id,
+                            "reasoning": True,
+                            "thinkingLevelMap": {
+                                "off": "none",
+                                "minimal": "minimal",
+                                "low": "low",
+                                "medium": "medium",
+                                "high": "high",
+                            },
+                        }
+                    ],
+                }
+            }
+        }
+        remote_dir = "/root/.pi/agent"
+        remote_path = f"{remote_dir}/models.json"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+            json.dump(models, handle, indent=2)
+            handle.write("\n")
+            local_path = Path(handle.name)
+        try:
+            await environment.exec(f"mkdir -p {shlex.quote(remote_dir)}")
+            await environment.upload_file(local_path, remote_path)
+        finally:
+            local_path.unlink(missing_ok=True)
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(f"mkdir -p {shlex.quote(str(self._remote_session_dir))}")
+        await self._ensure_pi(environment)
+        await self._write_pi_models(environment)
 
         # If a Pi extension path exists on the host, upload it. This makes a
         # local checkout of the official TDAI Pi plugin usable without asking
@@ -106,6 +228,17 @@ class PiTdaiBranchAgent(BaseAgent):
             else:
                 uploaded_extensions.append(extension)
         self.pi_extensions = uploaded_extensions
+
+        # Pi 0.73.1 never emits before_provider_headers, so the official TDAI
+        # plugin cannot set x-conversation-id. Re-register the provider with
+        # that header once the session id exists. Do not patch TDAI source.
+        local_conversation_id = Path(__file__).resolve().parents[2] / "extensions" / "tdai-conversation-id.ts"
+        if local_conversation_id.is_file():
+            remote_conversation_id = remote_user_ext_dir / "99-tdai-conversation-id.ts"
+            await environment.upload_file(local_conversation_id, str(remote_conversation_id))
+            remote_conversation_id_s = str(remote_conversation_id)
+            if remote_conversation_id_s not in self.pi_extensions:
+                self.pi_extensions.append(remote_conversation_id_s)
 
         if not self.branch_control_extension:
             return
@@ -173,7 +306,7 @@ class PiTdaiBranchAgent(BaseAgent):
         budget_ratio: float | None,
         snapshot: Path | None,
     ) -> None:
-        argv = [
+        pi_args = [
             self.pi_executable,
             "--print",
             "--mode",
@@ -184,16 +317,16 @@ class PiTdaiBranchAgent(BaseAgent):
             self.pi_thinking,
         ]
         if self.model_name:
-            argv.extend(["--model", self.model_name])
+            pi_args.extend(["--model", self.model_name])
         if resume:
-            argv.append("--continue")
+            pi_args.append("--continue")
         if fork_session is not None:
             remote_fork = self.environment_logs_dir / "checkpoint-session.jsonl"
             await environment.upload_file(fork_session, str(remote_fork))
-            argv.extend(["--fork", str(remote_fork)])
+            pi_args.extend(["--fork", str(remote_fork)])
 
         extensions = list(self.pi_extensions)
-        exec_env = self._tdai_env()
+        exec_env = self._runtime_env()
         if budget_ratio is not None:
             if snapshot is None or not snapshot.is_file():
                 raise FileNotFoundError(f"frozen recall snapshot missing: {snapshot}")
@@ -219,9 +352,17 @@ class PiTdaiBranchAgent(BaseAgent):
             )
 
         for extension in extensions:
-            argv.extend(["--extension", extension])
-        argv.append(instruction)
-
+            pi_args.extend(["--extension", extension])
+        pi_args.append(instruction)
+        inner = (
+            'export NVM_DIR="$HOME/.nvm"; '
+            '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
+            + " ".join(shlex.quote(arg) for arg in pi_args)
+            # Non-interactive: with an open stdin Pi can block waiting on input
+            # instead of exiting after --print.
+            + " </dev/null"
+        )
+        argv = ["bash", "-lc", inner]
         result = await environment.exec(" ".join(shlex.quote(arg) for arg in argv), env=exec_env or None)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.logs_dir / f"pi-step-{self._step_index}.stdout.jsonl").write_text(result.stdout or "", encoding="utf-8")
@@ -242,8 +383,12 @@ class PiTdaiBranchAgent(BaseAgent):
             )
 
     async def _current_pi_session_id(self, environment: BaseEnvironment) -> str:
+        # python3, not python: Ubuntu ships no unversioned `python`, and the
+        # heredoc swallows the resulting "command not found" as rc=0, so this
+        # failed silently and every recall snapshot came back as
+        # "pi-session-missing".
         command = (
-            "python - <<'PY'\n"
+            "python3 - <<'PY'\n"
             "import glob,json,os\n"
             f"files=glob.glob({str(self._remote_session_dir)!r}+'/*.jsonl')\n"
             "if not files: raise SystemExit(2)\n"
@@ -264,23 +409,36 @@ class PiTdaiBranchAgent(BaseAgent):
         query: str,
         limit: int,
     ) -> dict[str, Any]:
-        proxy = os.environ.get("TDAI_PROXY_URL", "http://127.0.0.1:8096").rstrip("/")
+        proxy = os.environ.get("TDAI_PROXY_URL", "http://host.docker.internal:8096").rstrip("/")
+        if "127.0.0.1" in proxy or "localhost" in proxy:
+            proxy = proxy.replace("127.0.0.1", "host.docker.internal").replace(
+                "localhost", "host.docker.internal"
+            )
         space = os.environ.get("TDAI_SPACE_ID", "default")
         url = f"{proxy}/memory-bridge/v3/{kind}"
         body = json.dumps({"query": query[:2048], "limit": limit}, ensure_ascii=False)
+        # Do not use curl -f: it discards the HTTP body on 4xx, which is the
+        # only place proxy puts "session not initialized" / auth errors.
+        remote_body = f"/tmp/tdai-bridge-{kind.replace('/', '-')}.json"
         command = " ".join(
             [
-                "curl", "-fsS", "--max-time", "20", "-X", "POST", shlex.quote(url),
+                "curl", "-sS", "--max-time", "20", "-o", shlex.quote(remote_body),
+                "-w", shlex.quote("%{http_code}"),
+                "-X", "POST", shlex.quote(url),
                 "-H", shlex.quote("Content-Type: application/json"),
                 "-H", shlex.quote(f"x-conversation-id: {conversation_id}"),
                 "-H", shlex.quote(f"x-tdai-service-id: {space}"),
                 "-d", shlex.quote(body),
             ]
         )
-        result = await environment.exec(command, env=self._tdai_env() or None)
-        if result.return_code != 0:
-            raise RuntimeError(f"memory bridge {kind} failed: {(result.stderr or '')[-1000:]}")
-        value = json.loads(result.stdout or "{}")
+        result = await environment.exec(command, env=self._runtime_env() or None)
+        status = (result.stdout or "").strip()
+        raw = await environment.exec(f"cat {shlex.quote(remote_body)} 2>/dev/null || true")
+        payload = (raw.stdout or "").strip()
+        if result.return_code != 0 or not status.startswith("2"):
+            detail = payload or (result.stderr or "").strip() or status
+            raise RuntimeError(f"memory bridge {kind} failed: HTTP {status or '?'} {detail[-1000:]}")
+        value = json.loads(payload or "{}")
         return value if isinstance(value, dict) else {}
 
     async def _capture_recall_snapshot(

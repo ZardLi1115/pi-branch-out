@@ -50,16 +50,16 @@ budget = budget_ratio × feasible_budget
 ```bash
 git clone https://github.com/ZardLi1115/pi-branch-out.git
 cd pi-branch-out
-git checkout feat/pi-tdai-harbor-branchout
 python -m pip install -e .
 ```
 
 需要本机已经能运行：
 
-- Harbor
-- Pi coding agent
+- Harbor **0.22+**（本仓库 agent 使用 `SUPPORTS_RESUME = True`。旧 Harbor 的 `harbor.agents.capabilities.AgentCapabilities` 已不存在。）
+- Pi coding agent **0.73.1**（Harbor 容器里会按这个版本安装）
 - TDAI Proxy / MemoryCore
-- EvoCodeBench 的 Harbor task
+- 一个 Harbor 多 step 任务。仓库里有一条可跑的 EvoCodeBench 示例：
+  `examples/harbor_tasks/evocodebench-run-cmd`（`chat.utils.run_cmd`）。原始 `data.jsonl` 不是 Harbor task。
 
 并准备好官方 TDAI Pi 插件，例如：
 
@@ -67,7 +67,7 @@ python -m pip install -e .
 /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
 ```
 
-本仓库不会改这个文件。`--pi-extension` 如果是本机文件，运行时会自动上传到 Harbor agent 环境。
+本仓库不会改这个文件。`--pi-extension` 如果是本机文件，运行时会自动上传到 Harbor agent 环境。`extensions/tdai-conversation-id.ts` 会由 agent 自动上传，不必再手动加一次。
 
 ## TDAI 环境变量
 
@@ -82,17 +82,18 @@ export TDAI_USER_KEY="<user-key>"
 export TDAI_MODEL="<model>"
 ```
 
-`TDAI_TASK_ID` 可选。
+`TDAI_TASK_ID` 对 memory 来说可选；但若 Proxy 开了 `sessionInit`，没有 task 时第一次 LLM 调用会被劫持成 `ask_followup_question` 表单（`content=None`）。采集时建议创建一个真实 task 并设置 `TDAI_TASK_ID`。
 
-注意：如果 Harbor task 跑在 Docker 容器里，`127.0.0.1:8096` 通常指容器自己，不是宿主机。请使用容器实际能访问的 Proxy 地址，例如同一 Docker network 的服务名，或你的环境已经配置好的 `host.docker.internal`。
+注意：如果 Harbor task 跑在 Docker 容器里，`127.0.0.1:8096` 通常指容器自己，不是宿主机。请使用容器实际能访问的 Proxy 地址，例如同一 Docker network 的服务名，或你的环境已经配置好的 `host.docker.internal`。Agent 会把 `TDAI_PROXY_URL` / `OPENAI_BASE_URL` 里的 loopback 改写成 `host.docker.internal`。
 
 ## 先跑一条 Natural
 
 ```bash
 pi-branch-out natural \
-  --task /data/EvoCodeBench/<task> \
-  --jobs-dir ./natural_runs/<task> \
+  --task ./examples/harbor_tasks/evocodebench-run-cmd \
+  --jobs-dir ./natural_runs/evocodebench-run-cmd \
   --model tdai/<model> \
+  --pi-thinking medium \
   --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
 ```
 
@@ -192,3 +193,52 @@ npx tsx --test tdai/tests/adaptive-memory.test.ts
 ```
 
 GitHub CI 会同时跑 Python 和 TypeScript 核心测试。
+
+## 本机踩坑（不要提交密钥）
+
+下面这些是 Harbor + Pi 0.73.1 + 当前 TDAI 镜像上踩过的坑。密钥、本机 Codex URL、`.tdai.env`、`natural_runs/`、`branch_runs/` **都不要进 git**。
+
+### 两条 provider 路径不要混
+
+- `--model cpa/<id>`：Pi 直连 Codex / 兼容 OpenAI Responses 的上游。需要 `CUSTOM_API_KEY` + `OPENAI_BASE_URL`（以及可选 `CPA_MODEL`）。**没有 memory。** 只适合接线冒烟。
+- `--model tdai/<id>`：走官方 TDAI Pi 插件，才有注入 / L0 写入 / frozen recall。这是采集路径。
+
+Pi 的 `models.json` 里 `apiKey` 必须是**裸环境变量名** `CUSTOM_API_KEY`。写成 `"$CUSTOM_API_KEY"` 时，`resolveConfigValue()` 会把它当字面量送出去，上游返回 401 Invalid API key。
+
+### Pi 0.73.1 没有 `before_provider_headers`
+
+官方插件用这个事件写 `x-conversation-id: pi-${sessionId}`。0.73.1 实际事件是 `session_start` / `before_agent_start` / `before_provider_request`（后者只能改 body）。结果是：
+
+- Proxy 按 API key hash 当 `sessionKey`，`conversationId=null`，`injectedSkipped=true`
+- `memory-bridge` 用 `pi-${sid}` 去查，401 `session not initialized`
+- Natural step 2+ 的 `recall_snapshot_status` 变成 `bridge-error`，Branch 无法启动
+
+本仓库不改 TDAI。`extensions/tdai-conversation-id.ts` 会在 session id 已知后**完整重注册** `tdai` provider（只改 headers 会把已存的 `apiKey` 清掉），带上静态 `x-conversation-id`。Harbor agent 会自动上传这个文件。
+
+修好后 step 2 应看到 `recall_snapshot_status = "ready"`，Proxy 日志应有 `injectedSkipped=false` 和 `write-l0`。
+
+### Frozen recall 的其它坑
+
+- `_current_pi_session_id` 必须调 `python3`。Ubuntu 24.04 没有无版本的 `python`；heredoc 会把 `command not found` 吞成 rc=0，快照变成 `pi-session-missing`。
+- Step 1 的 `session-not-initialized` 是设计如此：当时还没有 Pi session，不能做严格 Branch。
+- `memory-bridge` 不要用 `curl -f`：4xx 时 body 被丢掉，错误只剩空白。
+- 容器里查 session 文件用 in-container glob；host 侧 `download_dir` 只能用来做 checkpoint，不能用来代替 session id。
+
+### TDAI Proxy 镜像 vs 源码
+
+当前 `memory-proxy:latest` 的 `extractSpaceIdFromPath` allowlist **不含** `pi`（本地源码有）。`/pi/<space>/...` 会 401 `missing service_id`。采集时设 `TDAI_AGENT_SOURCE=codebuddy`（`claude-code` / `opencode` / `dsh` / `cursor` 也可以）。Proxy 要用 `PROXY_FULL_STACK=1`（auth + sessionInit + tdai）。Auth 要求 `MEMORY_CORE_GATEWAY_API_KEY` 为空。
+
+### Docker / Harbor
+
+- 容器访问宿主机服务一律 `host.docker.internal`，不要 `127.0.0.1`。
+- Docker VM 内存小时，task `memory_mb` 建议 2048。
+- 示例 Dockerfile 用了 DaoCloud / Aliyun 镜像；网络能直连 Docker Hub 时改回官方源即可。
+- `--print` 的 Pi 若 stdin 开着会一直等输入。agent 里用 `</dev/null`。
+- 非交互环境请加载 nvm 后再调 `pi`。
+
+### 不要提交的东西
+
+- 任何 API key / user key / `.env` / `.tdai.env`
+- 本机 Codex / cliproxy 地址和端口
+- `natural_runs/`、`branch_runs/`、Harbor job 产物
+- 对 `TencentDB-Agent-Memory` 的源码修改（本仓库约定不碰）
