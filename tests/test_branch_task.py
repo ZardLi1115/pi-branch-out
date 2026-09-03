@@ -11,7 +11,7 @@ from pi_branch_out.checkpoint import BranchAction, CheckpointManifest
 
 def test_budget_action_bounds() -> None:
     assert BranchAction(0).as_runtime_payload()["budget_ratio"] == 0
-    assert BranchAction(1).action_id == "budget-1.000"
+    assert BranchAction(1).action_id == "budget-1.000-standard"
     with pytest.raises(ValueError):
         BranchAction(-0.01)
     with pytest.raises(ValueError):
