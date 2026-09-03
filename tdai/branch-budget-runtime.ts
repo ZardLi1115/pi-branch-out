@@ -1,13 +1,17 @@
 import { writeFileSync } from "node:fs";
 
+export type MemoryGranularity = "compact" | "standard" | "detailed";
+
 export interface BranchBudgetOverride {
 	requestedRatio: number;
+	granularity: MemoryGranularity;
 	oneShot: boolean;
 }
 
 export interface BranchBudgetObservation {
 	requestedRatio: number;
 	appliedRatio: number;
+	granularity: MemoryGranularity;
 	feasibleBudgetTokens: number;
 	budgetTokens: number;
 	injectedTokens: number;
@@ -18,11 +22,11 @@ export interface BranchBudgetObservation {
 let consumed = false;
 
 /**
- * Read the one-shot counterfactual Memory budget requested by pi-branch-out.
+ * In-process TDAI fallback for deployments that do not use MemoryProxy.
  *
- * Copy/import this helper from the TDAI recall path before the normal learned
- * budget policy is evaluated. When it returns a value, that value must override
- * the policy for this recall only.
+ * The current official Pi integration goes through MemoryProxy and therefore
+ * uses explicit HTTP headers instead. Both paths expose the same ratio +
+ * granularity action semantics.
  */
 export function consumeBranchBudgetOverride(): BranchBudgetOverride | null {
 	if (consumed) return null;
@@ -32,15 +36,21 @@ export function consumeBranchBudgetOverride(): BranchBudgetOverride | null {
 	if (!Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
 		throw new Error(`Invalid TDAI_MEMORY_BUDGET_RATIO_OVERRIDE=${raw}`);
 	}
+	const granularityRaw = process.env.TDAI_MEMORY_GRANULARITY_OVERRIDE ?? "standard";
+	if (!["compact", "standard", "detailed"].includes(granularityRaw)) {
+		throw new Error(`Invalid TDAI_MEMORY_GRANULARITY_OVERRIDE=${granularityRaw}`);
+	}
 	const oneShot = process.env.TDAI_MEMORY_BUDGET_OVERRIDE_ONE_SHOT !== "0";
 	if (oneShot) consumed = true;
-	return { requestedRatio: ratio, oneShot };
+	return {
+		requestedRatio: ratio,
+		granularity: granularityRaw as MemoryGranularity,
+		oneShot,
+	};
 }
 
 /**
- * Emit proof that TDAI actually applied the requested branch action.
- * The Harbor branch runner reads this file after Pi exits and rejects the
- * branch when the observation is missing or mismatched.
+ * Emit proof that in-process TDAI actually applied the requested branch action.
  */
 export function writeBranchBudgetObservation(observation: BranchBudgetObservation): void {
 	const path = process.env.TDAI_BRANCH_OUT_OBSERVATION_FILE;
@@ -49,6 +59,7 @@ export function writeBranchBudgetObservation(observation: BranchBudgetObservatio
 		kind: "memory_budget_ratio",
 		requested_ratio: observation.requestedRatio,
 		applied_ratio: observation.appliedRatio,
+		granularity: observation.granularity,
 		feasible_budget_tokens: Math.max(0, Math.floor(observation.feasibleBudgetTokens)),
 		budget_tokens: Math.max(0, Math.floor(observation.budgetTokens)),
 		injected_tokens: Math.max(0, Math.floor(observation.injectedTokens)),
