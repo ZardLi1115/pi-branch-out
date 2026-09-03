@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pi-branch-out"
+version = "0.1.0"
+description = "Structured branch-out collection for Pi + TDAI Memory + Harbor multi-step tasks"
+requires-python = ">=3.11"
+dependencies = [
+  "tomlkit>=0.13.2",
+]
+
+[project.optional-dependencies]
+harbor = ["harbor>=0.1.0"]
+
+[project.scripts]
+pi-branch-out = "pi_branch_out.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pi_branch_out"]
