@@ -11,6 +11,7 @@ class BudgetObservation:
     feasible_budget_tokens: int
     budget_tokens: int
     injected_tokens: int
+    granularity: str = "standard"
 
     @classmethod
     def parse(cls, raw: str) -> "BudgetObservation":
@@ -23,9 +24,16 @@ class BudgetObservation:
             feasible_budget_tokens=int(value["feasible_budget_tokens"]),
             budget_tokens=int(value["budget_tokens"]),
             injected_tokens=int(value["injected_tokens"]),
+            granularity=str(value.get("granularity", "standard")),
         )
 
-    def verify(self, expected_ratio: float, *, tolerance: float = 1e-9) -> None:
+    def verify(
+        self,
+        expected_ratio: float,
+        expected_granularity: str = "standard",
+        *,
+        tolerance: float = 1e-9,
+    ) -> None:
         if abs(self.requested_ratio - expected_ratio) > tolerance:
             raise ValueError(
                 f"TDAI observation requested_ratio={self.requested_ratio} != expected={expected_ratio}"
@@ -33,6 +41,10 @@ class BudgetObservation:
         if abs(self.applied_ratio - expected_ratio) > tolerance:
             raise ValueError(
                 f"TDAI observation applied_ratio={self.applied_ratio} != expected={expected_ratio}"
+            )
+        if self.granularity != expected_granularity:
+            raise ValueError(
+                f"TDAI observation granularity={self.granularity} != expected={expected_granularity}"
             )
         if self.feasible_budget_tokens < 0 or self.budget_tokens < 0 or self.injected_tokens < 0:
             raise ValueError("TDAI observation contains negative token counts")
