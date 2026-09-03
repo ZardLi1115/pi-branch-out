@@ -13,13 +13,14 @@ def test_budget_observation_verifies_realized_action() -> None:
             "kind": "memory_budget_ratio",
             "requested_ratio": 0.8,
             "applied_ratio": 0.8,
+            "granularity": "detailed",
             "feasible_budget_tokens": 20000,
             "budget_tokens": 16000,
             "injected_tokens": 12000,
         }
     )
     observation = BudgetObservation.parse(raw)
-    observation.verify(0.8)
+    observation.verify(0.8, "detailed")
 
 
 def test_budget_observation_rejects_wrong_action() -> None:
@@ -32,6 +33,19 @@ def test_budget_observation_rejects_wrong_action() -> None:
     )
     with pytest.raises(ValueError):
         observation.verify(0.8)
+
+
+def test_budget_observation_rejects_wrong_granularity() -> None:
+    observation = BudgetObservation(
+        requested_ratio=0.8,
+        applied_ratio=0.8,
+        granularity="compact",
+        feasible_budget_tokens=20000,
+        budget_tokens=16000,
+        injected_tokens=10000,
+    )
+    with pytest.raises(ValueError):
+        observation.verify(0.8, "standard")
 
 
 def test_budget_observation_rejects_budget_overflow() -> None:
