@@ -90,6 +90,23 @@ class PiTdaiBranchAgent(BaseAgent):
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(f"mkdir -p {shlex.quote(str(self._remote_session_dir))}")
+
+        # If a Pi extension path exists on the host, upload it. This makes a
+        # local checkout of the official TDAI Pi plugin usable without asking
+        # the caller to separately mount that file into every Harbor container.
+        uploaded_extensions: list[str] = []
+        remote_user_ext_dir = self.environment_logs_dir / "pi-user-extensions"
+        await environment.exec(f"mkdir -p {shlex.quote(str(remote_user_ext_dir))}")
+        for index, extension in enumerate(self.pi_extensions):
+            local = Path(extension).expanduser().resolve()
+            if local.is_file():
+                remote = remote_user_ext_dir / f"{index:02d}-{local.name}"
+                await environment.upload_file(local, str(remote))
+                uploaded_extensions.append(str(remote))
+            else:
+                uploaded_extensions.append(extension)
+        self.pi_extensions = uploaded_extensions
+
         if not self.branch_control_extension:
             return
         local_extension = Path(self.branch_control_extension).resolve()
@@ -272,9 +289,6 @@ class PiTdaiBranchAgent(BaseAgent):
         instruction: str,
         checkpoint_root: Path,
     ) -> tuple[str | None, str]:
-        # The Memory Bridge requires an initialized Proxy session. Harbor step 1
-        # is therefore baseline-only; from step 2 onward the previous Pi request
-        # has initialized the session and we can freeze a true pre-action recall.
         if self._step_index <= 1:
             return None, "session-not-initialized"
         session_id = await self._current_pi_session_id(environment)
