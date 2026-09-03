@@ -43,6 +43,7 @@ export interface AllocationResult {
   injectedTokens: number;
   droppedL1Ids: string[];
   skippedOversizeL0Ids: string[];
+  skippedDuplicateL0Ids: string[];
 }
 
 export function maxL0PerL1(granularity: MemoryGranularity): number {
@@ -77,6 +78,7 @@ function assertCandidate(candidate: L1Candidate): void {
  *    per-L1 Top-0/Top-1/Top-3 semantics.
  * 5. An oversized L0 chunk is skipped, never truncated. The allocator may still
  *    consider later, smaller chunks for other admitted L1 atoms.
+ * 6. The same L0 message id is injected at most once globally.
  */
 export function allocateProgressiveMemory(input: AllocationInput): AllocationResult {
   const budgetTokens = Math.max(0, Math.floor(input.budgetTokens));
@@ -84,6 +86,7 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
   const selected: SelectedL1[] = [];
   const droppedL1Ids: string[] = [];
   const skippedOversizeL0Ids: string[] = [];
+  const skippedDuplicateL0Ids: string[] = [];
 
   let used = 0;
   for (let index = 0; index < input.candidates.length; index += 1) {
@@ -102,18 +105,24 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
 
   const l1Tokens = used;
   let l0Tokens = 0;
+  const selectedL0Ids = new Set<string>();
 
   if (maxL0 > 0 && selected.length > 0 && used < budgetTokens) {
     for (let depth = 0; depth < maxL0; depth += 1) {
       for (const memory of selected) {
         const chunk = memory.l0[depth];
         if (!chunk) continue;
+        if (selectedL0Ids.has(chunk.id)) {
+          skippedDuplicateL0Ids.push(chunk.id);
+          continue;
+        }
         const cost = Math.floor(chunk.tokenCount);
         if (used + cost > budgetTokens) {
           skippedOversizeL0Ids.push(chunk.id);
           continue;
         }
         memory.selectedL0.push(chunk);
+        selectedL0Ids.add(chunk.id);
         used += cost;
         l0Tokens += cost;
       }
@@ -127,6 +136,7 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
     injectedTokens: used,
     droppedL1Ids,
     skippedOversizeL0Ids,
+    skippedDuplicateL0Ids,
   };
 }
 
