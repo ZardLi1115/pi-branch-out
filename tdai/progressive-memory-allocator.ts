@@ -1,5 +1,3 @@
-export type MemoryGranularity = "compact" | "standard" | "detailed";
-
 export interface L0Candidate {
   id: string;
   content: string;
@@ -17,19 +15,13 @@ export interface L1Candidate {
   type?: string;
   fromAgentId?: string;
   fromAgentName?: string;
-  /**
-   * Associated L0 candidates, already ordered by the retrieval layer.
-   * v1 may be query-conditioned same-session L0. A future provenance-aware
-   * retriever can fill this array from source_message_ids without changing the
-   * allocator.
-   */
+  /** L0 candidates are already ordered by the retrieval layer. */
   l0: L0Candidate[];
 }
 
 export interface AllocationInput {
   candidates: L1Candidate[];
   budgetTokens: number;
-  granularity: MemoryGranularity;
 }
 
 export interface SelectedL1 extends L1Candidate {
@@ -46,12 +38,6 @@ export interface AllocationResult {
   skippedDuplicateL0Ids: string[];
 }
 
-export function maxL0PerL1(granularity: MemoryGranularity): number {
-  if (granularity === "compact") return 0;
-  if (granularity === "standard") return 1;
-  return 3;
-}
-
 function assertCandidate(candidate: L1Candidate): void {
   if (!candidate.id) throw new Error("L1 candidate id is required");
   if (!Number.isFinite(candidate.tokenCount) || candidate.tokenCount < 0) {
@@ -66,23 +52,20 @@ function assertCandidate(candidate: L1Candidate): void {
 }
 
 /**
- * Deterministic allocator used by both natural policy execution and branch-out.
+ * Deterministic budget-driven allocator.
  *
- * Invariants:
- * 1. A selected L1 atom is always complete. No truncation is allowed.
- * 2. L1 admission is ordered by the retrieval layer. If the next complete atom
- *    does not fit, lower-ranked L1 atoms are not admitted either.
- * 3. Only the remaining budget can be used by L0.
- * 4. L0 expansion is round-robin over admitted L1 atoms. This prevents the
- *    first L1 from consuming the entire expansion budget while preserving the
- *    per-L1 Top-0/Top-1/Top-3 semantics.
- * 5. An oversized L0 chunk is skipped, never truncated. The allocator may still
- *    consider later, smaller chunks for other admitted L1 atoms.
- * 6. The same L0 message id is injected at most once globally.
+ * 1. Admit complete L1 atoms in retrieval order. Never truncate an L1.
+ * 2. If the next L1 does not fit, stop admitting lower-ranked L1s.
+ * 3. Spend all remaining budget on L0 in round-robin depth order:
+ *    every admitted L1 gets a chance at depth 0, then depth 1, etc.
+ * 4. Oversized L0 chunks are skipped, never truncated.
+ * 5. The same L0 id is injected at most once globally.
+ *
+ * There is intentionally no learned or configured "granularity". A larger
+ * budget naturally creates deeper L0 expansion.
  */
 export function allocateProgressiveMemory(input: AllocationInput): AllocationResult {
   const budgetTokens = Math.max(0, Math.floor(input.budgetTokens));
-  const maxL0 = maxL0PerL1(input.granularity);
   const selected: SelectedL1[] = [];
   const droppedL1Ids: string[] = [];
   const skippedOversizeL0Ids: string[] = [];
@@ -94,9 +77,7 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
     assertCandidate(candidate);
     const cost = Math.floor(candidate.tokenCount);
     if (used + cost > budgetTokens) {
-      for (let j = index; j < input.candidates.length; j += 1) {
-        droppedL1Ids.push(input.candidates[j].id);
-      }
+      for (let j = index; j < input.candidates.length; j += 1) droppedL1Ids.push(input.candidates[j].id);
       break;
     }
     selected.push({ ...candidate, selectedL0: [] });
@@ -106,27 +87,30 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
   const l1Tokens = used;
   let l0Tokens = 0;
   const selectedL0Ids = new Set<string>();
+  let depth = 0;
+  let anyCandidateAtDepth = true;
 
-  if (maxL0 > 0 && selected.length > 0 && used < budgetTokens) {
-    for (let depth = 0; depth < maxL0; depth += 1) {
-      for (const memory of selected) {
-        const chunk = memory.l0[depth];
-        if (!chunk) continue;
-        if (selectedL0Ids.has(chunk.id)) {
-          skippedDuplicateL0Ids.push(chunk.id);
-          continue;
-        }
-        const cost = Math.floor(chunk.tokenCount);
-        if (used + cost > budgetTokens) {
-          skippedOversizeL0Ids.push(chunk.id);
-          continue;
-        }
-        memory.selectedL0.push(chunk);
-        selectedL0Ids.add(chunk.id);
-        used += cost;
-        l0Tokens += cost;
+  while (selected.length > 0 && used < budgetTokens && anyCandidateAtDepth) {
+    anyCandidateAtDepth = false;
+    for (const memory of selected) {
+      const chunk = memory.l0[depth];
+      if (!chunk) continue;
+      anyCandidateAtDepth = true;
+      if (selectedL0Ids.has(chunk.id)) {
+        skippedDuplicateL0Ids.push(chunk.id);
+        continue;
       }
+      const cost = Math.floor(chunk.tokenCount);
+      if (used + cost > budgetTokens) {
+        skippedOversizeL0Ids.push(chunk.id);
+        continue;
+      }
+      memory.selectedL0.push(chunk);
+      selectedL0Ids.add(chunk.id);
+      used += cost;
+      l0Tokens += cost;
     }
+    depth += 1;
   }
 
   return {
@@ -144,7 +128,7 @@ export function renderProgressiveMemory(result: AllocationResult): string {
   if (result.selected.length === 0) return "";
   const lines: string[] = [
     "<tdai_recalled_memories>",
-    "以下为当前轮按 Memory Budget 选择的结构化记忆。L1 为完整原子记忆，L0 为按预算渐进展开的原始对话片段：",
+    "以下为当前轮在 Memory Budget 内选择的记忆。L1 始终完整，剩余预算用于逐层展开 L0：",
   ];
 
   result.selected.forEach((memory, index) => {
