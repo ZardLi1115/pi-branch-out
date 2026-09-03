@@ -33,6 +33,7 @@ def _agent_kwargs(
         pairs.append(("checkpoint_dir", str(checkpoint.resolve())))
     if action is not None:
         pairs.append(("budget_ratio", str(action.budget_ratio)))
+        pairs.append(("memory_granularity", action.granularity))
         pairs.append(
             (
                 "require_budget_observation",
@@ -93,7 +94,7 @@ def run_branch(args: argparse.Namespace) -> int:
     source_task = Path(args.task).resolve()
     checkpoint = Path(args.checkpoint).resolve()
     manifest = CheckpointManifest.load(checkpoint / "checkpoint.json")
-    action = BranchAction(float(args.budget_ratio))
+    action = BranchAction(float(args.budget_ratio), args.granularity)
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("branch-%Y%m%dT%H%M%SZ")
     output_root = Path(args.output_root).resolve() / run_id
@@ -182,12 +183,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     branch = sub.add_parser(
         "branch",
-        help="Restore one checkpoint and force one Memory budget action",
+        help="Restore one checkpoint and force one adaptive Memory action",
     )
     _common(branch)
     branch.add_argument("--task", required=True, help="Original EvoCodeBench task directory")
     branch.add_argument("--checkpoint", required=True)
     branch.add_argument("--budget-ratio", required=True, type=float)
+    branch.add_argument(
+        "--granularity",
+        choices=("compact", "standard", "detailed"),
+        default="standard",
+        help="Maximum progressive L0 expansion depth: 0, 1, or 3 chunks per admitted L1.",
+    )
     branch.add_argument("--output-root", default="branch_runs")
     branch.add_argument("--run-id")
     branch.add_argument(
