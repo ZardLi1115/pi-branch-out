@@ -18,11 +18,11 @@ from .pi_session import create_checkpoint_session, only_session_file, terminal_e
 class PiTdaiBranchAgent(BaseAgent):
     """Harbor agent that keeps one native Pi session across multi-step tasks.
 
-    Natural mode captures a *pre-action* checkpoint at the beginning of every
-    Harbor step. That checkpoint contains the current workspace, the Pi session
-    ending before the new user instruction, and optional TDAI local state.
+    Natural mode captures a pre-action checkpoint at the beginning of every
+    Harbor step. A checkpoint contains the current workspace, the Pi session
+    ending before the new user instruction, and optional local TDAI state.
 
-    Branch mode restores one such checkpoint, forks the native Pi session, and
+    Branch mode restores one checkpoint, forks the native Pi session, and
     applies a Memory budget override to the first resumed step only.
     """
 
@@ -58,7 +58,6 @@ class PiTdaiBranchAgent(BaseAgent):
         self.branch_budget_ratio = float(budget_ratio) if budget_ratio not in (None, "") else None
         self.branch_control_extension = branch_control_extension.strip()
         self._step_index = 0
-        self._branch_started = False
 
     @property
     def _remote_session_dir(self) -> PurePosixPath:
@@ -82,10 +81,19 @@ class PiTdaiBranchAgent(BaseAgent):
         self._step_index += 1
         if self.branch_checkpoint is None:
             await self._capture_pre_action_checkpoint(environment, step_name=f"step-{self._step_index}")
-            await self._run_pi(instruction, environment, context, resume=False, fork_session=None, budget_ratio=None)
+            await self._run_pi(
+                instruction,
+                environment,
+                context,
+                resume=False,
+                fork_session=None,
+                budget_ratio=None,
+            )
             return
 
         manifest = CheckpointManifest.load(self.branch_checkpoint / "checkpoint.json")
+        if not manifest.pi_checkpoint_session:
+            raise ValueError("selected checkpoint has no prior Pi session and cannot be forked")
         checkpoint_session = self.branch_checkpoint / manifest.pi_checkpoint_session
         await self._run_pi(
             instruction,
@@ -95,7 +103,6 @@ class PiTdaiBranchAgent(BaseAgent):
             fork_session=checkpoint_session,
             budget_ratio=self.branch_budget_ratio,
         )
-        self._branch_started = True
 
     async def resume(
         self,
@@ -106,9 +113,16 @@ class PiTdaiBranchAgent(BaseAgent):
         self._step_index += 1
         if self.branch_checkpoint is None:
             await self._capture_pre_action_checkpoint(environment, step_name=f"step-{self._step_index}")
-        # The branch intervention is deliberately one-shot. Every later Harbor
-        # step continues the branch session with no forced budget action.
-        await self._run_pi(instruction, environment, context, resume=True, fork_session=None, budget_ratio=None)
+        # Branch intervention is one-shot. Later Harbor steps continue the same
+        # branch session without a forced budget action.
+        await self._run_pi(
+            instruction,
+            environment,
+            context,
+            resume=True,
+            fork_session=None,
+            budget_ratio=None,
+        )
 
     async def _run_pi(
         self,
@@ -160,12 +174,16 @@ class PiTdaiBranchAgent(BaseAgent):
             finally:
                 local_action.unlink(missing_ok=True)
             exec_env["PI_BRANCH_OUT_ACTION_FILE"] = str(self._remote_action_file)
-            # This direct variable is also supplied for a TDAI adapter that does
-            # not need the small Pi bridge extension.
+            # A patched TDAI adapter can consume this variable directly. The
+            # bridge extension in this repository exposes the same value.
             exec_env["TDAI_MEMORY_BUDGET_RATIO_OVERRIDE"] = str(budget_ratio)
 
+        # Pi print mode accepts the prompt as its final argv item. Avoid stdin:
+        # Harbor's BaseEnvironment.exec contract does not expose stdin uniformly
+        # across providers.
+        argv.append(instruction)
         command = " ".join(shlex.quote(arg) for arg in argv)
-        result = await environment.exec(command, env=exec_env or None, stdin=instruction)
+        result = await environment.exec(command, env=exec_env or None)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         (self.logs_dir / f"pi-step-{self._step_index}.stdout.jsonl").write_text(
             result.stdout or "", encoding="utf-8"
@@ -203,8 +221,8 @@ class PiTdaiBranchAgent(BaseAgent):
             pi_source = str(source_session.relative_to(checkpoint_root))
             pi_checkpoint = str(checkpoint_session.relative_to(checkpoint_root))
         except Exception:
-            # Step 1 may legitimately have no prior Pi messages. Keep an empty
-            # marker and let branch planning skip this checkpoint.
+            # Step 1 normally has no previous Pi message yet. The checkpoint is
+            # still useful as an initial workspace snapshot, but cannot be forked.
             leaf_id = ""
             pi_source = ""
             pi_checkpoint = ""
@@ -224,7 +242,7 @@ class PiTdaiBranchAgent(BaseAgent):
                 tdai_archive = local_tdai.name
                 tdai_mode = "directory"
 
-        manifest = CheckpointManifest(
+        CheckpointManifest(
             task_name=environment.environment_name,
             step_index=self._step_index,
             step_name=step_name,
@@ -234,8 +252,7 @@ class PiTdaiBranchAgent(BaseAgent):
             pi_leaf_id=leaf_id,
             tdai_state_archive=tdai_archive,
             tdai_state_mode=tdai_mode,
-        )
-        manifest.dump(checkpoint_root / "checkpoint.json")
+        ).dump(checkpoint_root / "checkpoint.json")
 
     async def _restore_checkpoint(self, environment: BaseEnvironment, checkpoint_dir: Path) -> None:
         manifest = CheckpointManifest.load(checkpoint_dir / "checkpoint.json")
@@ -247,14 +264,17 @@ class PiTdaiBranchAgent(BaseAgent):
         cwd = (cwd_result.stdout or "/app").strip() or "/app"
         remote_workspace = "/tmp/pi-branch-workspace-restore.tar.gz"
         await environment.upload_file(workspace_archive, remote_workspace)
-        # Preserve the working directory itself and replace its contents.
         await environment.exec(
             f"find {shlex.quote(cwd)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
             f"tar -xzf {shlex.quote(remote_workspace)} -C {shlex.quote(cwd)} && "
             f"rm -f {shlex.quote(remote_workspace)}"
         )
 
-        if manifest.tdai_state_mode == "directory" and manifest.tdai_state_archive and self.tdai_state_dir:
+        if (
+            manifest.tdai_state_mode == "directory"
+            and manifest.tdai_state_archive
+            and self.tdai_state_dir
+        ):
             local_tdai = checkpoint_dir / manifest.tdai_state_archive
             remote_tdai = "/tmp/pi-branch-tdai-restore.tar.gz"
             await environment.upload_file(local_tdai, remote_tdai)
