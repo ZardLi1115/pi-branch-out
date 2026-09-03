@@ -22,8 +22,9 @@ class PiTdaiBranchAgent(BaseAgent):
     Harbor step. A checkpoint contains the current workspace, the Pi session
     ending before the new user instruction, and optional local TDAI state.
 
-    Branch mode restores one checkpoint, forks the native Pi session when one
-    exists, and applies a Memory budget override to the first resumed step only.
+    Branch mode restores one checkpoint at the same pre-action boundary, forks
+    the native Pi session when one exists, and applies a Memory budget override
+    to the first resumed step only.
     """
 
     capabilities = AgentCapabilities(resume=True)
@@ -59,6 +60,7 @@ class PiTdaiBranchAgent(BaseAgent):
         self.branch_control_extension = branch_control_extension.strip()
         self._remote_branch_control_extension = ""
         self._step_index = 0
+        self._branch_restored = False
 
     @property
     def _remote_session_dir(self) -> PurePosixPath:
@@ -77,11 +79,7 @@ class PiTdaiBranchAgent(BaseAgent):
                 await environment.upload_file(local_bridge, str(remote_bridge))
                 self._remote_branch_control_extension = str(remote_bridge)
             else:
-                # Also allow an extension path that is already visible inside
-                # the Harbor environment.
                 self._remote_branch_control_extension = self.branch_control_extension
-        if self.branch_checkpoint is not None:
-            await self._restore_checkpoint(environment, self.branch_checkpoint)
 
     async def run(
         self,
@@ -101,6 +99,14 @@ class PiTdaiBranchAgent(BaseAgent):
                 budget_ratio=None,
             )
             return
+
+        # Harbor calls agent.setup() before the current step's workdir/setup.sh,
+        # while natural checkpoints are captured after _prepare_step and just
+        # before the agent sees the new instruction. Restore here, not setup(),
+        # so branch and natural runs start from the same pre-action state.
+        if not self._branch_restored:
+            await self._restore_checkpoint(environment, self.branch_checkpoint)
+            self._branch_restored = True
 
         manifest = CheckpointManifest.load(self.branch_checkpoint / "checkpoint.json")
         checkpoint_session = (
@@ -126,8 +132,6 @@ class PiTdaiBranchAgent(BaseAgent):
         self._step_index += 1
         if self.branch_checkpoint is None:
             await self._capture_pre_action_checkpoint(environment, step_name=f"step-{self._step_index}")
-        # Branch intervention is one-shot. Later Harbor steps continue the same
-        # branch session without a forced budget action.
         await self._run_pi(
             instruction,
             environment,
@@ -187,8 +191,6 @@ class PiTdaiBranchAgent(BaseAgent):
             finally:
                 local_action.unlink(missing_ok=True)
             exec_env["PI_BRANCH_OUT_ACTION_FILE"] = str(self._remote_action_file)
-            # A patched TDAI adapter can consume this variable directly. The
-            # bridge extension exposes the same value inside Pi.
             exec_env["TDAI_MEMORY_BUDGET_RATIO_OVERRIDE"] = str(budget_ratio)
 
         argv.append(instruction)
@@ -231,8 +233,6 @@ class PiTdaiBranchAgent(BaseAgent):
             pi_source = str(source_session.relative_to(checkpoint_root))
             pi_checkpoint = str(checkpoint_session.relative_to(checkpoint_root))
         except Exception:
-            # Step 1 normally has no previous Pi message yet. It is still a
-            # valid branch point: branch mode simply starts a fresh Pi session.
             leaf_id = ""
             pi_source = ""
             pi_checkpoint = ""
