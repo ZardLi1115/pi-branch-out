@@ -15,7 +15,12 @@ from .checkpoint import BranchAction, CheckpointManifest
 AGENT_IMPORT = "pi_branch_out.harbor_agent:PiTdaiBranchAgent"
 
 
-def _agent_kwargs(args: argparse.Namespace, *, checkpoint: Path | None = None, action: BranchAction | None = None) -> list[str]:
+def _agent_kwargs(
+    args: argparse.Namespace,
+    *,
+    checkpoint: Path | None = None,
+    action: BranchAction | None = None,
+) -> list[str]:
     pairs: list[tuple[str, str]] = [
         ("pi_executable", args.pi_executable),
         ("pi_thinking", args.pi_thinking),
@@ -82,8 +87,6 @@ def run_branch(args: argparse.Namespace) -> int:
     source_task = Path(args.task).resolve()
     checkpoint = Path(args.checkpoint).resolve()
     manifest = CheckpointManifest.load(checkpoint / "checkpoint.json")
-    if not manifest.pi_checkpoint_session:
-        raise ValueError("checkpoint has no Pi session; choose step 2 or later")
     action = BranchAction(float(args.budget_ratio))
 
     run_id = args.run_id or datetime.now(timezone.utc).strftime("branch-%Y%m%dT%H%M%SZ")
@@ -100,6 +103,7 @@ def run_branch(args: argparse.Namespace) -> int:
         "checkpoint": str(checkpoint),
         "source_step_index": manifest.step_index,
         "source_step_name": manifest.step_name,
+        "has_native_pi_history": bool(manifest.pi_checkpoint_session),
         "action": action.as_runtime_payload(),
         "branch_task": str(branch_task),
         "jobs_dir": str(jobs_dir),
@@ -135,17 +139,24 @@ def _common(parser: argparse.ArgumentParser) -> None:
         "--pi-extension",
         action="append",
         default=[],
-        help="Pi extension path visible inside the Harbor agent environment; repeatable. Put the TDAI Pi adapter here.",
+        help=(
+            "Pi extension path visible inside the Harbor agent environment; repeatable. "
+            "Put the TDAI Pi adapter here."
+        ),
     )
     parser.add_argument(
         "--tdai-state-dir",
         default="",
-        help="Optional TDAI local state directory inside the Harbor environment. Empty for external Gateway mode.",
+        help=(
+            "Optional TDAI local state directory inside the Harbor environment. "
+            "Leave empty when TDAI uses an external Gateway; external state needs "
+            "its own snapshot/namespace adapter."
+        ),
     )
     parser.add_argument(
         "--branch-control-extension",
         default=str(Path(__file__).resolve().parents[2] / "extensions" / "tdai-budget-override.ts"),
-        help="Host path to the tiny one-shot budget bridge extension.",
+        help="Host path to the one-shot TDAI budget bridge extension.",
     )
 
 
@@ -153,13 +164,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pi + TDAI + Harbor structured branch-out runner")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    natural = sub.add_parser("natural", help="Run a natural multi-step task and capture pre-action checkpoints")
+    natural = sub.add_parser(
+        "natural",
+        help="Run a natural multi-step task and capture pre-action checkpoints",
+    )
     _common(natural)
     natural.add_argument("--task", required=True)
     natural.add_argument("--jobs-dir", required=True)
     natural.set_defaults(func=run_natural)
 
-    branch = sub.add_parser("branch", help="Restore one checkpoint and force one Memory budget action")
+    branch = sub.add_parser(
+        "branch",
+        help="Restore one checkpoint and force one Memory budget action",
+    )
     _common(branch)
     branch.add_argument("--task", required=True, help="Original EvoCodeBench task directory")
     branch.add_argument("--checkpoint", required=True)
