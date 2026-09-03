@@ -1,20 +1,15 @@
-export type BudgetRatioSource = "branch" | "policy" | "default";
+export type BudgetRatioSource = "branch" | "policy" | "baseline";
 
 export interface MemoryBudgetInput {
-  /** Counterfactual override. Highest priority when present. */
   branchRatio?: number | null;
-  /** Future CQL/Base Policy output. Not required for branch-out collection. */
   policyRatio?: number | null;
-  /** Stable fallback when neither branch nor policy supplies a ratio. */
-  defaultRatio?: number;
-
-  /** Model context window for this request. */
+  baselineRatio?: number;
   contextWindowTokens: number;
-  /** Tokens already occupied before dynamic L1/L0 injection. */
   currentContextTokens: number;
-  /** Reserved space for output, tool growth, and safety margin. */
   reserveTokens: number;
-  /** Optional experiment/operator cap. Omit or <=0 for no additional cap. */
+  /** Total token cost of the frozen L1/L0 candidate pool. */
+  candidateTokens: number;
+  /** Optional operator safety cap. */
   hardCapTokens?: number | null;
 }
 
@@ -25,16 +20,15 @@ export interface MemoryBudgetDecision {
   contextWindowTokens: number;
   currentContextTokens: number;
   reserveTokens: number;
+  candidateTokens: number;
   headroomTokens: number;
   hardCapTokens: number | null;
   feasibleBudgetTokens: number;
   budgetTokens: number;
 }
 
-function finiteNonNegativeInt(name: string, value: number): number {
-  if (!Number.isFinite(value) || value < 0) {
-    throw new Error(`${name} must be a finite non-negative number, got ${value}`);
-  }
+function nonNegativeInt(name: string, value: number): number {
+  if (!Number.isFinite(value) || value < 0) throw new Error(`${name} must be finite and >= 0, got ${value}`);
   return Math.floor(value);
 }
 
@@ -45,47 +39,36 @@ export function validateBudgetRatio(name: string, value: number): number {
   return value;
 }
 
-export function resolveBudgetRatio(input: Pick<MemoryBudgetInput, "branchRatio" | "policyRatio" | "defaultRatio">): {
+export function resolveBudgetRatio(input: Pick<MemoryBudgetInput, "branchRatio" | "policyRatio" | "baselineRatio">): {
   source: BudgetRatioSource;
   ratio: number;
 } {
-  if (input.branchRatio != null) {
-    return { source: "branch", ratio: validateBudgetRatio("branchRatio", input.branchRatio) };
-  }
-  if (input.policyRatio != null) {
-    return { source: "policy", ratio: validateBudgetRatio("policyRatio", input.policyRatio) };
-  }
-  const fallback = input.defaultRatio ?? 1;
-  return { source: "default", ratio: validateBudgetRatio("defaultRatio", fallback) };
+  if (input.branchRatio != null) return { source: "branch", ratio: validateBudgetRatio("branchRatio", input.branchRatio) };
+  if (input.policyRatio != null) return { source: "policy", ratio: validateBudgetRatio("policyRatio", input.policyRatio) };
+  return { source: "baseline", ratio: validateBudgetRatio("baselineRatio", input.baselineRatio ?? 0) };
 }
 
 /**
- * Convert a ratio action into a token cap for this turn.
+ * Convert a budget-ratio action into a per-turn token cap.
  *
- * The controller deliberately does not try to "fill" the budget. It only
- * computes a maximum. The allocator may inject fewer tokens when there are not
- * enough useful candidates or when the next complete L1 atom does not fit.
+ * The feasible budget is candidate-aware. This prevents a large model context
+ * window from collapsing multiple ratio actions into the exact same injected
+ * memory when the actual recall pool is much smaller.
  */
 export function decideMemoryBudget(input: MemoryBudgetInput): MemoryBudgetDecision {
-  const contextWindowTokens = finiteNonNegativeInt("contextWindowTokens", input.contextWindowTokens);
-  const currentContextTokens = finiteNonNegativeInt("currentContextTokens", input.currentContextTokens);
-  const reserveTokens = finiteNonNegativeInt("reserveTokens", input.reserveTokens);
-
-  if (contextWindowTokens === 0) {
-    throw new Error("contextWindowTokens must be greater than zero");
-  }
+  const contextWindowTokens = nonNegativeInt("contextWindowTokens", input.contextWindowTokens);
+  const currentContextTokens = nonNegativeInt("currentContextTokens", input.currentContextTokens);
+  const reserveTokens = nonNegativeInt("reserveTokens", input.reserveTokens);
+  const candidateTokens = nonNegativeInt("candidateTokens", input.candidateTokens);
+  if (contextWindowTokens === 0) throw new Error("contextWindowTokens must be > 0");
 
   const { source, ratio } = resolveBudgetRatio(input);
   const headroomTokens = Math.max(0, contextWindowTokens - currentContextTokens - reserveTokens);
-
   let hardCapTokens: number | null = null;
-  if (input.hardCapTokens != null && input.hardCapTokens > 0) {
-    hardCapTokens = finiteNonNegativeInt("hardCapTokens", input.hardCapTokens);
-  }
+  if (input.hardCapTokens != null && input.hardCapTokens > 0) hardCapTokens = nonNegativeInt("hardCapTokens", input.hardCapTokens);
 
-  const feasibleBudgetTokens = hardCapTokens == null
-    ? headroomTokens
-    : Math.min(headroomTokens, hardCapTokens);
+  let feasibleBudgetTokens = Math.min(headroomTokens, candidateTokens);
+  if (hardCapTokens != null) feasibleBudgetTokens = Math.min(feasibleBudgetTokens, hardCapTokens);
   const budgetTokens = Math.floor(feasibleBudgetTokens * ratio);
 
   return {
@@ -95,6 +78,7 @@ export function decideMemoryBudget(input: MemoryBudgetInput): MemoryBudgetDecisi
     contextWindowTokens,
     currentContextTokens,
     reserveTokens,
+    candidateTokens,
     headroomTokens,
     hardCapTokens,
     feasibleBudgetTokens,
