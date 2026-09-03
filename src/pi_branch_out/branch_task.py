@@ -36,9 +36,12 @@ def build_branch_task(source_task: Path, checkpoint_dir: Path, output_dir: Path)
 
     task_toml = output_dir / "task.toml"
     doc = tomlkit.parse(task_toml.read_text(encoding="utf-8"))
-    steps = doc.get("steps")
-    if not isinstance(steps, list) or not steps:
+    raw_steps = doc.get("steps")
+    if raw_steps is None:
         raise ValueError(f"task has no [[steps]] array: {task_toml}")
+    steps = list(raw_steps)
+    if not steps:
+        raise ValueError(f"task has an empty [[steps]] array: {task_toml}")
 
     # step_index is 1-based and points to the user request that has not yet run.
     start = manifest.step_index - 1
@@ -46,13 +49,14 @@ def build_branch_task(source_task: Path, checkpoint_dir: Path, output_dir: Path)
         raise ValueError(
             f"checkpoint step_index={manifest.step_index} outside task step range 1..{len(steps)}"
         )
-    kept = list(steps[start:])
-    doc["steps"] = tomlkit.aot()
+    kept = steps[start:]
+    new_steps = tomlkit.aot()
     for step in kept:
-        doc["steps"].append(step)
+        new_steps.append(step)
+    doc["steps"] = new_steps
 
     metadata = doc.get("metadata")
-    if isinstance(metadata, dict):
+    if metadata is not None:
         metadata["branch_out_source_step"] = manifest.step_index
         metadata["branch_out_checkpoint"] = str(checkpoint_dir)
 
