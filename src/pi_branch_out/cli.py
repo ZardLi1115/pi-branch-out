@@ -13,19 +13,14 @@ from .checkpoint import BranchAction, CheckpointManifest
 
 
 AGENT_IMPORT = "pi_branch_out.harbor_agent:PiTdaiBranchAgent"
+DEFAULT_ACTIONS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 
 
-def _agent_kwargs(
-    args: argparse.Namespace,
-    *,
-    checkpoint: Path | None = None,
-    action: BranchAction | None = None,
-) -> list[str]:
+def _agent_kwargs(args: argparse.Namespace, *, checkpoint: Path | None = None, action: BranchAction | None = None) -> list[str]:
     pairs: list[tuple[str, str]] = [
         ("pi_executable", args.pi_executable),
         ("pi_thinking", args.pi_thinking),
         ("pi_extensions", ",".join(args.pi_extension or [])),
-        ("tdai_state_dir", args.tdai_state_dir or ""),
     ]
     if args.branch_control_extension:
         pairs.append(("branch_control_extension", str(Path(args.branch_control_extension).resolve())))
@@ -33,13 +28,7 @@ def _agent_kwargs(
         pairs.append(("checkpoint_dir", str(checkpoint.resolve())))
     if action is not None:
         pairs.append(("budget_ratio", str(action.budget_ratio)))
-        pairs.append(("memory_granularity", action.granularity))
-        pairs.append(
-            (
-                "require_budget_observation",
-                "false" if getattr(args, "allow_unverified_budget", False) else "true",
-            )
-        )
+        pairs.append(("require_budget_observation", "false" if args.allow_unverified_budget else "true"))
 
     result: list[str] = []
     for key, value in pairs:
@@ -58,29 +47,22 @@ def _harbor_command(
     command = shlex.split(args.harbor_bin)
     command.extend(
         [
-            "run",
-            "--path",
-            str(task.resolve()),
-            "--agent",
-            AGENT_IMPORT,
-            "--model",
-            args.model,
-            "--n-attempts",
-            "1",
-            "--n-concurrent",
-            "1",
+            "run", "--path", str(task.resolve()),
+            "--agent", AGENT_IMPORT,
+            "--model", args.model,
+            "--n-attempts", "1",
+            "--n-concurrent", "1",
             "--resume-trajectory",
-            "--jobs-dir",
-            str(jobs_dir.resolve()),
+            "--jobs-dir", str(jobs_dir.resolve()),
         ]
     )
     command.extend(_agent_kwargs(args, checkpoint=checkpoint, action=action))
     return command
 
 
-def _run(command: list[str], *, cwd: Path | None = None) -> int:
+def _run(command: list[str]) -> int:
     print("[pi-branch-out]", shlex.join(command), flush=True)
-    return subprocess.run(command, cwd=cwd, env=os.environ.copy(), check=False).returncode
+    return subprocess.run(command, env=os.environ.copy(), check=False).returncode
 
 
 def run_natural(args: argparse.Namespace) -> int:
@@ -90,52 +72,72 @@ def run_natural(args: argparse.Namespace) -> int:
     return _run(_harbor_command(args, task=task, jobs_dir=jobs_dir))
 
 
-def run_branch(args: argparse.Namespace) -> int:
+def _run_one_branch(args: argparse.Namespace, checkpoint: Path, ratio: float, output_root: Path, run_id: str) -> int:
     source_task = Path(args.task).resolve()
-    checkpoint = Path(args.checkpoint).resolve()
     manifest = CheckpointManifest.load(checkpoint / "checkpoint.json")
-    action = BranchAction(float(args.budget_ratio), args.granularity)
+    if manifest.recall_snapshot_status != "ready" or not manifest.recall_snapshot:
+        raise ValueError(
+            f"checkpoint step {manifest.step_index} has no frozen recall snapshot; "
+            "step 1 is baseline-only and cannot be used for strict branch-out"
+        )
+    action = BranchAction(ratio)
+    run_root = output_root / run_id
+    if run_root.exists() and any(run_root.iterdir()):
+        raise FileExistsError(f"branch output is not empty: {run_root}")
+    run_root.mkdir(parents=True, exist_ok=True)
 
-    run_id = args.run_id or datetime.now(timezone.utc).strftime("branch-%Y%m%dT%H%M%SZ")
-    output_root = Path(args.output_root).resolve() / run_id
-    if output_root.exists() and any(output_root.iterdir()):
-        raise FileExistsError(f"branch output is not empty: {output_root}")
-    output_root.mkdir(parents=True, exist_ok=True)
-
-    branch_task = build_branch_task(source_task, checkpoint, output_root / "task")
-    jobs_dir = output_root / "jobs"
+    branch_task = build_branch_task(source_task, checkpoint, run_root / "task")
+    jobs_dir = run_root / "jobs"
     metadata = {
         "run_id": run_id,
         "source_task": str(source_task),
         "checkpoint": str(checkpoint),
         "source_step_index": manifest.step_index,
         "source_step_name": manifest.step_name,
-        "has_native_pi_history": bool(manifest.pi_checkpoint_session),
+        "recall_snapshot": manifest.recall_snapshot,
+        "baseline_budget_ratio": manifest.baseline_budget_ratio,
         "action": action.as_runtime_payload(),
-        "require_budget_observation": not args.allow_unverified_budget,
         "branch_task": str(branch_task),
         "jobs_dir": str(jobs_dir),
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
-    (output_root / "branch_request.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-
-    rc = _run(
-        _harbor_command(
-            args,
-            task=branch_task,
-            jobs_dir=jobs_dir,
-            checkpoint=checkpoint,
-            action=action,
-        )
-    )
+    (run_root / "branch_request.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rc = _run(_harbor_command(args, task=branch_task, jobs_dir=jobs_dir, checkpoint=checkpoint, action=action))
     metadata["return_code"] = rc
     metadata["finished_at"] = datetime.now(timezone.utc).isoformat()
-    (output_root / "branch_result.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    (run_root / "branch_result.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return rc
+
+
+def run_branch(args: argparse.Namespace) -> int:
+    checkpoint = Path(args.checkpoint).resolve()
+    run_id = args.run_id or datetime.now(timezone.utc).strftime("branch-%Y%m%dT%H%M%SZ")
+    return _run_one_branch(args, checkpoint, float(args.budget_ratio), Path(args.output_root).resolve(), run_id)
+
+
+def _parse_ratios(raw: str) -> list[float]:
+    values = [float(item.strip()) for item in raw.split(",") if item.strip()]
+    if not values:
+        values = list(DEFAULT_ACTIONS)
+    for value in values:
+        BranchAction(value)
+    return values
+
+
+def run_branch_grid(args: argparse.Namespace) -> int:
+    checkpoint = Path(args.checkpoint).resolve()
+    ratios = _parse_ratios(args.ratios)
+    root = Path(args.output_root).resolve()
+    stamp = args.run_id_prefix or datetime.now(timezone.utc).strftime("grid-%Y%m%dT%H%M%SZ")
+    failures = 0
+    for ratio in ratios:
+        run_id = f"{stamp}-budget-{ratio:.3f}"
+        rc = _run_one_branch(args, checkpoint, ratio, root, run_id)
+        if rc != 0:
+            failures += 1
+            if args.fail_fast:
+                return rc
+    return 1 if failures else 0
 
 
 def _common(parser: argparse.ArgumentParser) -> None:
@@ -144,27 +146,24 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--pi-executable", default="pi")
     parser.add_argument("--pi-thinking", default="off")
     parser.add_argument(
-        "--pi-extension",
-        action="append",
-        default=[],
-        help=(
-            "Pi extension path visible inside the Harbor agent environment; repeatable. "
-            "Put the TDAI Pi adapter here."
-        ),
-    )
-    parser.add_argument(
-        "--tdai-state-dir",
-        default="",
-        help=(
-            "Optional TDAI local state directory inside the Harbor environment. "
-            "Leave empty when TDAI uses an external Gateway; external state needs "
-            "its own snapshot/namespace adapter."
-        ),
+        "--pi-extension", action="append", default=[],
+        help="Pi extension path visible inside Harbor; repeatable. Add the official TDAI Pi plugin here.",
     )
     parser.add_argument(
         "--branch-control-extension",
         default=str(Path(__file__).resolve().parents[2] / "extensions" / "tdai-budget-override.ts"),
-        help="Host path to the one-shot TDAI budget bridge extension.",
+        help="Host path to the external budget adapter. It never patches TDAI.",
+    )
+
+
+def _branch_common(parser: argparse.ArgumentParser) -> None:
+    _common(parser)
+    parser.add_argument("--task", required=True)
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--output-root", default="branch_runs")
+    parser.add_argument(
+        "--allow-unverified-budget", action="store_true",
+        help="Keep a branch if the external adapter does not emit an observation. Wiring-only; do not use for training data.",
     )
 
 
@@ -172,40 +171,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Pi + TDAI + Harbor structured branch-out runner")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    natural = sub.add_parser(
-        "natural",
-        help="Run a natural multi-step task and capture pre-action checkpoints",
-    )
+    natural = sub.add_parser("natural", help="Run the untouched Pi+TDAI baseline and freeze pre-action recall snapshots")
     _common(natural)
     natural.add_argument("--task", required=True)
     natural.add_argument("--jobs-dir", required=True)
     natural.set_defaults(func=run_natural)
 
-    branch = sub.add_parser(
-        "branch",
-        help="Restore one checkpoint and force one adaptive Memory action",
-    )
-    _common(branch)
-    branch.add_argument("--task", required=True, help="Original EvoCodeBench task directory")
-    branch.add_argument("--checkpoint", required=True)
+    branch = sub.add_parser("branch", help="Restore one checkpoint and force one Memory Budget ratio")
+    _branch_common(branch)
     branch.add_argument("--budget-ratio", required=True, type=float)
-    branch.add_argument(
-        "--granularity",
-        choices=("compact", "standard", "detailed"),
-        default="standard",
-        help="Maximum progressive L0 expansion depth: 0, 1, or 3 chunks per admitted L1.",
-    )
-    branch.add_argument("--output-root", default="branch_runs")
     branch.add_argument("--run-id")
-    branch.add_argument(
-        "--allow-unverified-budget",
-        action="store_true",
-        help=(
-            "Do not fail when TDAI does not emit a realized budget observation. "
-            "Use only while wiring the integration, never for training-data collection."
-        ),
-    )
     branch.set_defaults(func=run_branch)
+
+    grid = sub.add_parser("branch-grid", help="Run several budget counterfactuals from the same frozen checkpoint")
+    _branch_common(grid)
+    grid.add_argument("--ratios", default=",".join(str(v) for v in DEFAULT_ACTIONS))
+    grid.add_argument("--run-id-prefix")
+    grid.add_argument("--fail-fast", action="store_true")
+    grid.set_defaults(func=run_branch_grid)
     return parser
 
 
