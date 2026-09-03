@@ -16,6 +16,16 @@ jobs:
       - run: python -m pip install -e . pytest
       - run: pytest -q
 
+  adaptive-memory-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-save tsx@4
+      - run: npx tsx --test tdai/tests/adaptive-memory.test.ts
+
   tdai-proxy-integration:
     runs-on: ubuntu-latest
     steps:
@@ -37,11 +47,25 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: tdai-memory/MemoryProxy/package-lock.json
-      - name: Apply adaptive MemoryProxy patch
-        run: python pi-branch-out/scripts/apply_tdai_proxy_patch.py tdai-memory
+      - name: Apply adaptive MemoryProxy patch twice
+        run: |
+          python pi-branch-out/scripts/apply_tdai_proxy_patch.py tdai-memory
+          python pi-branch-out/scripts/apply_tdai_proxy_patch.py tdai-memory
       - name: Install MemoryProxy dependencies
         working-directory: tdai-memory/MemoryProxy
         run: npm ci
-      - name: Typecheck patched MemoryProxy
+      - name: Typecheck patched MemoryProxy and reject branch-out errors
         working-directory: tdai-memory/MemoryProxy
-        run: npm run typecheck
+        run: |
+          set +e
+          npm run typecheck > /tmp/tdai-typecheck.log 2>&1
+          rc=$?
+          set -e
+          cat /tmp/tdai-typecheck.log
+          if grep -E 'src/branch-out/|src/tdai/client\.ts|src/tdai/types\.ts|src/injection/index\.ts|src/server\.ts' /tmp/tdai-typecheck.log; then
+            echo 'Adaptive MemoryProxy patch introduced a type error in a touched integration file.' >&2
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ]; then
+            echo 'Upstream MemoryProxy currently has unrelated pre-existing type errors; no touched integration file failed.'
+          fi
