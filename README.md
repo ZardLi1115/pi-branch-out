@@ -16,6 +16,8 @@ Harbor 某轮开始前保存 checkpoint
   ↓
 只强制当前这一轮 Memory Budget
   ↓
+验证 TDAI 确实执行了该 Budget
+  ↓
 下一轮起恢复正常策略
   ↓
 继续运行到任务结束
@@ -30,6 +32,7 @@ Harbor 某轮开始前保存 checkpoint
 3. **TDAI 状态必须一致**：本地状态目录可直接打包恢复；如果使用外部 Gateway，需要额外提供隔离 namespace 或服务端 snapshot/restore。
 4. **只干预一次**：分支的第一轮使用指定 `budget_ratio`，后续 Harbor step 通过 Pi `--continue` 正常继续。
 5. **Budget 是比例，不是固定 Token**：`budget_ratio` 作用于 TDAI Runtime 计算出的本轮可行 Memory 预算，因此长任务可以自然超过固定 16K 上限。
+6. **反事实必须可验证**：正式采集默认要求 TDAI 输出 realized-action 记录；没有记录或实际比例不一致时，该 branch 直接失败，避免伪反事实混入训练数据。
 
 建议首版动作集合：
 
@@ -104,13 +107,15 @@ pi-branch-out branch \
   ↓
 生成只包含当前轮及后续轮次的 Harbor task
   ↓
-恢复代码工作区
+Harbor 准备当前 step
   ↓
-恢复 TDAI 状态
+恢复自然轨迹保存的代码/TDAI 状态
   ↓
 Pi --fork checkpoint-session.jsonl
   ↓
 当前轮注入 budget_ratio=0.8
+  ↓
+读取 TDAI realized-action observation 并校验
   ↓
 当前轮结束
   ↓
@@ -119,37 +124,74 @@ Pi --fork checkpoint-session.jsonl
 Harbor verifier 正常运行直到 task 结束
 ```
 
-分支目录会保存 `branch_request.json`、Harbor jobs 和 `branch_result.json`。
+分支目录会保存 `branch_request.json`、Harbor jobs、`branch_result.json`，以及 TDAI 成功上报后的 `tdai-budget-observation-step-*.json`。
 
 ## TDAI Budget 接口
 
-本仓库提供 `extensions/tdai-budget-override.ts`，分支第一轮会设置：
+分支第一轮会给 Pi/TDAI 进程设置：
 
 ```text
 TDAI_MEMORY_BUDGET_RATIO_OVERRIDE=<0..1>
 TDAI_MEMORY_BUDGET_OVERRIDE_ONE_SHOT=1
+TDAI_BRANCH_OUT_OBSERVATION_FILE=<path>
 ```
 
-TDAI 的自适应 Recall 实现需要消费这两个值：
+`extensions/tdai-budget-override.ts` 负责把 Branch action 暴露给同一 Pi 进程中的 TDAI 扩展。`tdai/branch-budget-runtime.ts` 给出了 TDAI Runtime 侧可以直接复用的读取/回写契约。
+
+TDAI 的自适应 Recall 应按下面顺序执行：
 
 ```text
 用户输入
   ↓
 TDAI 宽召回候选池
   ↓
-如果存在 Branch override：使用指定 budget_ratio
-否则：使用当前 Policy 输出
+consumeBranchBudgetOverride()
+  ↓
+存在 Branch override → 本轮覆盖正常 Policy
+不存在 → 使用正常 Policy 输出
   ↓
 计算 feasible_memory_budget
   ↓
 actual_budget = budget_ratio × feasible_memory_budget
   ↓
 确定性分配：完整 L1 优先，剩余预算渐进展开 L0
+  ↓
+writeBranchBudgetObservation(...)
 ```
 
-**当前仓库只实现 Branch-out 与 override 传递，不修改 TencentDB-Agent-Memory 本体。** 在 TDAI Runtime 尚未读取 `TDAI_MEMORY_BUDGET_RATIO_OVERRIDE` 前，分支虽然可以正确恢复 Pi/Harbor 状态，但不同预算不会真正改变 Memory 注入内容。
+Observation 至少包含：
 
-正式采集时还应让 TDAI 每轮记录：请求的 `budget_ratio`、本轮 `feasible_budget`、实际 Memory Token、最终注入的 L1/L0 ID，便于验证分支 Action 是否真正执行。
+```json
+{
+  "kind": "memory_budget_ratio",
+  "requested_ratio": 0.8,
+  "applied_ratio": 0.8,
+  "feasible_budget_tokens": 20000,
+  "budget_tokens": 16000,
+  "injected_tokens": 12740,
+  "l1_ids": [],
+  "l0_ids": []
+}
+```
+
+Branch runner 会检查：
+
+- `requested_ratio` 与本次 Branch Action 一致；
+- `applied_ratio` 与本次 Branch Action 一致；
+- `budget_tokens <= feasible_budget_tokens`；
+- `injected_tokens <= budget_tokens`。
+
+任一条件不满足，branch 失败。
+
+为了只验证 Pi/Harbor 恢复链路，可以临时添加：
+
+```bash
+--allow-unverified-budget
+```
+
+但该参数**不能用于正式训练数据采集**。
+
+**当前仓库提供 Branch-out、override 传递和 TDAI 接口辅助代码，但尚未直接修改 TencentDB-Agent-Memory 本体的 Recall 流程。** 在 TDAI Runtime 真正接入 `consumeBranchBudgetOverride()` 和 `writeBranchBudgetObservation()` 前，正式 Branch 默认会 fail-closed。
 
 ## 外部 TDAI Gateway
 
