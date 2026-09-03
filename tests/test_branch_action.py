@@ -5,21 +5,18 @@ import pytest
 from pi_branch_out.checkpoint import BranchAction
 
 
-def test_branch_action_contains_ratio_and_granularity() -> None:
-    action = BranchAction(0.6, "detailed")
-    assert action.action_id == "budget-0.600-detailed"
+def test_branch_action_contains_ratio_only() -> None:
+    action = BranchAction(0.6)
+    assert action.action_id == "budget-0.600"
     assert action.as_runtime_payload() == {
         "kind": "memory_budget_ratio",
         "budget_ratio": 0.6,
-        "granularity": "detailed",
-        "one_shot": True,
+        "one_step": True,
     }
 
 
-def test_branch_action_defaults_to_standard() -> None:
-    assert BranchAction(0.2).granularity == "standard"
-
-
-def test_branch_action_rejects_invalid_granularity() -> None:
+def test_branch_action_rejects_out_of_range_ratio() -> None:
     with pytest.raises(ValueError):
-        BranchAction(0.5, "huge")  # type: ignore[arg-type]
+        BranchAction(-0.01)
+    with pytest.raises(ValueError):
+        BranchAction(1.01)
