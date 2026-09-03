@@ -1,79 +1,12 @@
 # pi-branch-out
 
-用于 **Pi + TDAI Memory + Harbor 多轮编码任务** 的结构化 Branch-out 采集。
+用于 **Pi + TDAI Memory + Harbor / EvoCodeBench** 的结构化 Branch-out 数据采集。
 
-核心目标不是重新拼接一段历史 Prompt，而是从真实运行轨迹中恢复同一个决策点：
+这套代码有一个硬边界：**不修改 TencentDB-Agent-Memory、MemoryCore 或 MemoryProxy 源码。** TDAI 只作为现成服务使用。我们通过官方 Pi 插件走 TDAI Proxy，并通过现有只读 `memory-bridge` 冻结 L1/L0 候选；Budget Controller、上下文分配和 Branch-out 全部发生在本仓库与 Pi extension 侧。
 
-```text
-自然轨迹
-  ↓
-Harbor 某轮开始前保存 checkpoint
-  ├─ 代码工作区
-  ├─ Pi 原生 JSONL session
-  └─ TDAI 状态（本地模式可直接快照）
-  ↓
-从 checkpoint 建立反事实分支
-  ↓
-只强制当前这一轮 Memory Budget
-  ↓
-验证 TDAI 确实执行了该 Budget
-  ↓
-下一轮起恢复正常策略
-  ↓
-继续运行到任务结束
-```
+## 现在能做什么
 
-这套结构面向 EvoCodeBench 这类 Harbor multi-step 任务。每个 benchmark step 就对应一次新的用户需求，也是当前方案中一次 Memory Budget 决策的自然边界。
-
-## 设计原则
-
-1. **保留 Pi 原生结构化历史**：checkpoint 沿 Pi session 的 `parentId` 链裁剪，再用 `--fork` 继续，不把历史扁平化成文本。
-2. **Coding 环境必须一起恢复**：代码、依赖和生成文件都会影响后续行为，因此 checkpoint 同时保存工作区。
-3. **TDAI 状态必须一致**：本地状态目录可直接打包恢复；如果使用外部 Gateway，需要额外提供隔离 namespace 或服务端 snapshot/restore。
-4. **只干预一次**：分支的第一轮使用指定 `budget_ratio`，后续 Harbor step 通过 Pi `--continue` 正常继续。
-5. **Budget 是比例，不是固定 Token**：`budget_ratio` 作用于 TDAI Runtime 计算出的本轮可行 Memory 预算，因此长任务可以自然超过固定 16K 上限。
-6. **反事实必须可验证**：正式采集默认要求 TDAI 输出 realized-action 记录；没有记录或实际比例不一致时，该 branch 直接失败，避免伪反事实混入训练数据。
-
-建议首版动作集合：
-
-```text
-0.0 / 0.2 / 0.4 / 0.6 / 0.8 / 1.0
-```
-
-`0.0` 表示当前轮关闭动态 L1/L0 自动注入，`1.0` 表示允许使用全部本轮可行动态 Memory 预算。
-
-## 安装
-
-```bash
-pip install -e .
-```
-
-运行环境还需要：
-
-- Harbor
-- Pi coding agent
-- 能在 Pi 内工作的 TDAI Memory 适配
-- EvoCodeBench task 目录
-
-Harbor 必须启用 `--resume-trajectory`，这样同一任务后续 step 会调用 Agent 的 `resume()`，Pi session 才能连续。
-
-## 1. 采自然轨迹
-
-```bash
-pi-branch-out natural \
-  --task /data/EvoCodeBench/<task> \
-  --jobs-dir ./natural_runs/<task> \
-  --model <provider/model> \
-  --pi-extension /path/in/container/to/tdai-pi-adapter.ts
-```
-
-如果 TDAI 状态保存在 Harbor agent 容器内，还可以指定：
-
-```bash
---tdai-state-dir /path/to/tdai/state
-```
-
-Agent 会在每个 Harbor step **处理当前用户需求之前** 保存：
+Natural 运行保持当前 Pi + TDAI 的原始行为，不额外自动注入动态 L1/L0。Harbor 从第 2 个 step 开始，在 Pi 处理当前 instruction 之前保存：
 
 ```text
 branch-checkpoints/step-002/
@@ -81,142 +14,181 @@ branch-checkpoints/step-002/
 ├── workspace.tar.gz
 ├── checkpoint-session.jsonl
 ├── pi-session-full/
-└── tdai-state.tar.gz       # 仅本地 TDAI 状态模式
+└── recall-snapshot.json
 ```
 
-第一轮开始前还没有 Pi 历史，因此 `checkpoint-session.jsonl` 可以为空；该 checkpoint 仍可作为“新会话 + 不同预算”的分支起点。
+`recall-snapshot.json` 是当时通过 TDAI 现有只读 `atomic/search` + `conversation/search` 得到的候选快照。之后 Branch 不再实时查询 TDAI，而是始终使用这份冻结候选，因此不会看到自然轨迹后续产生的“未来记忆”。
 
-## 2. 从某个 checkpoint Branch-out
+Branch 的唯一动作是：
 
-例如强制当前轮使用 80% 可行 Memory 预算：
+```text
+budget_ratio ∈ [0, 1]
+```
+
+推荐第一批使用：
+
+```text
+0 / 0.2 / 0.4 / 0.6 / 0.8 / 1.0
+```
+
+实际预算不是固定 Token，而是：
+
+```text
+feasible_budget = min(
+    当前上下文剩余空间,
+    冻结候选池总 Token,
+    可选 hard cap
+)
+
+budget = budget_ratio × feasible_budget
+```
+
+具体 Memory 如何装入是确定性的：先按 TDAI 召回顺序放完整 L1；剩余预算再对已选 L1 逐层、轮流补 L0，直到预算或 L0 用完。没有单独的“展开粒度”动作。
+
+## 安装
+
+```bash
+git clone https://github.com/ZardLi1115/pi-branch-out.git
+cd pi-branch-out
+git checkout feat/pi-tdai-harbor-branchout
+python -m pip install -e .
+```
+
+需要本机已经能运行：
+
+- Harbor
+- Pi coding agent
+- TDAI Proxy / MemoryCore
+- EvoCodeBench 的 Harbor task
+
+并准备好官方 TDAI Pi 插件，例如：
+
+```text
+/path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
+```
+
+本仓库不会改这个文件。`--pi-extension` 如果是本机文件，运行时会自动上传到 Harbor agent 环境。
+
+## TDAI 环境变量
+
+至少准备：
+
+```bash
+export TDAI_PROXY_URL="http://<Harbor容器可访问的proxy地址>:8096"
+export TDAI_SPACE_ID="default"
+export TDAI_TEAM_ID="<team>"
+export TDAI_AGENT_ID="<agent>"
+export TDAI_USER_KEY="<user-key>"
+export TDAI_MODEL="<model>"
+```
+
+`TDAI_TASK_ID` 可选。
+
+注意：如果 Harbor task 跑在 Docker 容器里，`127.0.0.1:8096` 通常指容器自己，不是宿主机。请使用容器实际能访问的 Proxy 地址，例如同一 Docker network 的服务名，或你的环境已经配置好的 `host.docker.internal`。
+
+## 先跑一条 Natural
+
+```bash
+pi-branch-out natural \
+  --task /data/EvoCodeBench/<task> \
+  --jobs-dir ./natural_runs/<task> \
+  --model tdai/<model> \
+  --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
+```
+
+第 1 个 Harbor step 用来建立真实 Pi/TDAI session，因此只作为 baseline，不做严格 Branch。第 2 个 step 起，checkpoint 中应出现：
+
+```text
+recall_snapshot_status = "ready"
+```
+
+如果是 `bridge-error`，先检查 `TDAI_PROXY_URL` 是否能从 Harbor agent 环境访问，以及 Natural 第 1 step 是否已经成功通过 TDAI Proxy。
+
+## 从一个 checkpoint 跑单个 Branch
 
 ```bash
 pi-branch-out branch \
   --task /data/EvoCodeBench/<task> \
-  --checkpoint ./natural_runs/.../branch-checkpoints/step-005 \
-  --budget-ratio 0.8 \
+  --checkpoint ./natural_runs/.../branch-checkpoints/step-003 \
+  --budget-ratio 0.4 \
   --output-root ./branch_runs \
-  --model <provider/model> \
-  --pi-extension /path/in/container/to/tdai-pi-adapter.ts
+  --model tdai/<model> \
+  --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
 ```
 
-执行过程：
+Branch 会：
 
 ```text
-读取 checkpoint
-  ↓
-生成只包含当前轮及后续轮次的 Harbor task
-  ↓
-Harbor 准备当前 step
-  ↓
-恢复自然轨迹保存的代码/TDAI 状态
-  ↓
-Pi --fork checkpoint-session.jsonl
-  ↓
-当前轮注入 budget_ratio=0.8
-  ↓
-读取 TDAI realized-action observation 并校验
-  ↓
-当前轮结束
-  ↓
-后续轮 Pi --continue，不再强制预算
-  ↓
-Harbor verifier 正常运行直到 task 结束
+恢复 workspace
+→ fork 当时的 Pi 原生 session
+→ 读取冻结 recall-snapshot.json
+→ 只在当前 step 强制 budget_ratio=0.4
+→ Pi context hook 注入选中的 L1/L0
+→ 写 budget-observation.json
+→ 当前 step 结束后解除干预
+→ 后续 Harbor step 恢复原始 Pi+TDAI 行为
+→ 一直跑到任务结束
 ```
 
-分支目录会保存 `branch_request.json`、Harbor jobs、`branch_result.json`，以及 TDAI 成功上报后的 `tdai-budget-observation-step-*.json`。
-
-## TDAI Budget 接口
-
-分支第一轮会给 Pi/TDAI 进程设置：
-
-```text
-TDAI_MEMORY_BUDGET_RATIO_OVERRIDE=<0..1>
-TDAI_MEMORY_BUDGET_OVERRIDE_ONE_SHOT=1
-TDAI_BRANCH_OUT_OBSERVATION_FILE=<path>
-```
-
-`extensions/tdai-budget-override.ts` 负责把 Branch action 暴露给同一 Pi 进程中的 TDAI 扩展。`tdai/branch-budget-runtime.ts` 给出了 TDAI Runtime 侧可以直接复用的读取/回写契约。
-
-TDAI 的自适应 Recall 应按下面顺序执行：
-
-```text
-用户输入
-  ↓
-TDAI 宽召回候选池
-  ↓
-consumeBranchBudgetOverride()
-  ↓
-存在 Branch override → 本轮覆盖正常 Policy
-不存在 → 使用正常 Policy 输出
-  ↓
-计算 feasible_memory_budget
-  ↓
-actual_budget = budget_ratio × feasible_memory_budget
-  ↓
-确定性分配：完整 L1 优先，剩余预算渐进展开 L0
-  ↓
-writeBranchBudgetObservation(...)
-```
-
-Observation 至少包含：
-
-```json
-{
-  "kind": "memory_budget_ratio",
-  "requested_ratio": 0.8,
-  "applied_ratio": 0.8,
-  "feasible_budget_tokens": 20000,
-  "budget_tokens": 16000,
-  "injected_tokens": 12740,
-  "l1_ids": [],
-  "l0_ids": []
-}
-```
-
-Branch runner 会检查：
-
-- `requested_ratio` 与本次 Branch Action 一致；
-- `applied_ratio` 与本次 Branch Action 一致；
-- `budget_tokens <= feasible_budget_tokens`；
-- `injected_tokens <= budget_tokens`。
-
-任一条件不满足，branch 失败。
-
-为了只验证 Pi/Harbor 恢复链路，可以临时添加：
+## 一次跑多个 Budget
 
 ```bash
---allow-unverified-budget
+pi-branch-out branch-grid \
+  --task /data/EvoCodeBench/<task> \
+  --checkpoint ./natural_runs/.../branch-checkpoints/step-003 \
+  --ratios 0,0.2,0.4,0.6,0.8,1.0 \
+  --output-root ./branch_runs \
+  --model tdai/<model> \
+  --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
 ```
 
-但该参数**不能用于正式训练数据采集**。
+每个 ratio 使用独立 Harbor run 目录。首轮建议串行执行，确认 namespace / session 不互相污染后再考虑并发。
 
-**当前仓库提供 Branch-out、override 传递和 TDAI 接口辅助代码，但尚未直接修改 TencentDB-Agent-Memory 本体的 Recall 流程。** 在 TDAI Runtime 真正接入 `consumeBranchBudgetOverride()` 和 `writeBranchBudgetObservation()` 前，正式 Branch 默认会 fail-closed。
+## 采集结果在哪里
 
-## 外部 TDAI Gateway
-
-如果 TDAI 数据不在 Harbor 容器，而是共享远端 Gateway，不能仅复制本地目录来恢复 checkpoint。建议二选一：
-
-- 每条 natural / branch rollout 使用独立的 Memory namespace，并从 checkpoint 克隆 namespace；
-- 给 Gateway 增加显式 snapshot/restore API。
-
-在完成其中一种方案前，不应并行运行共享同一 TDAI namespace 的同任务分支，否则分支会互相污染。
-
-## 与训练数据的关系
-
-Branch-out 本身不训练模型。它负责得到可信的反事实轨迹：
+Natural 数据主要在：
 
 ```text
-同一个 State
-  ├─ 20% Budget → 后续轨迹 → Reward / Cost
-  ├─ 60% Budget → 后续轨迹 → Reward / Cost
-  └─ 100% Budget → 后续轨迹 → Reward / Cost
+natural_runs/<task>/...
+├── pi-step-*.stdout.jsonl
+├── pi-step-*.stderr.txt
+└── branch-checkpoints/step-*/
 ```
 
-之后再把自然轨迹和分支轨迹整理为：
+每个 Branch 目录主要包含：
 
 ```text
-(s_t, a_t, r_t, s_t+1, done)
+branch_request.json
+branch_result.json
+jobs/
 ```
 
-供 CQL + 小型 MLP 训练使用。
+Harbor Agent 日志还会保存：
+
+```text
+budget-observation-step-*.json
+```
+
+其中记录 requested/applied ratio、冻结候选池大小、feasible budget、实际 budget、注入 Token、L1/L0 id。正式数据默认 fail-closed：如果外部 Pi adapter 没真正执行指定 Budget，就不会把 branch 当作有效结果。
+
+## 冷启动怎么做
+
+当前 Pi + TDAI 本身没有我们新增的动态 L1/L0 Budget Policy，所以 Natural 的真实 F 动作记为 `0`。第一批数据建议先跑一批 untouched Natural，再从 step 2+ 的 checkpoint 对邻近几个 Budget 做 Branch-out。这样第一版 CQL 训练前就已经有“同一个 State、不同 Budget”的真实长期结果，不需要先训练一个 MLP，也不需要随机破坏 Natural 质量。
+
+等第一版 MLP + CQL 出来以后，只需要替换 Budget ratio 的来源：
+
+```text
+Branch override > MLP policy > baseline
+```
+
+确定性的 Recall Snapshot、Budget Controller 和 L1/L0 allocator 不需要改。
+
+## 测试
+
+```bash
+pytest -q
+npm install --no-save tsx@4
+npx tsx --test tdai/tests/adaptive-memory.test.ts
+```
+
+GitHub CI 会同时跑 Python 和 TypeScript 核心测试。
