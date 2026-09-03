@@ -11,7 +11,7 @@ from pi_branch_out.checkpoint import BranchAction, CheckpointManifest
 
 def test_budget_action_bounds() -> None:
     assert BranchAction(0).as_runtime_payload()["budget_ratio"] == 0
-    assert BranchAction(1).action_id == "budget-1.000-standard"
+    assert BranchAction(1).action_id == "budget-1.000"
     with pytest.raises(ValueError):
         BranchAction(-0.01)
     with pytest.raises(ValueError):
@@ -42,6 +42,8 @@ def test_branch_task_keeps_current_and_later_steps(tmp_path: Path) -> None:
         pi_checkpoint_session="checkpoint-session.jsonl",
         pi_source_session="source.jsonl",
         pi_leaf_id="leaf",
+        recall_snapshot="recall-snapshot.json",
+        recall_snapshot_status="ready",
     ).dump(checkpoint / "checkpoint.json")
 
     output = build_branch_task(task, checkpoint, tmp_path / "branch-task")
