@@ -3,10 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
-
-
-MemoryGranularity = Literal["compact", "standard", "detailed"]
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -22,6 +19,10 @@ class CheckpointManifest:
     tdai_state_mode: str = "none"
     source_trial_dir: str | None = None
     source_reward: float | None = None
+    recall_snapshot: str | None = None
+    recall_snapshot_status: str = "missing"
+    baseline_budget_ratio: float | None = None
+    baseline_action: float | None = None
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointManifest":
@@ -37,34 +38,27 @@ class CheckpointManifest:
 
 @dataclass(frozen=True)
 class BranchAction:
-    """One-shot adaptive-memory action.
+    """One-shot dynamic-memory budget action.
 
-    ``budget_ratio`` is relative to the feasible dynamic-memory budget computed
-    by TDAI. ``granularity`` controls the maximum L0 expansion depth per
-    admitted complete L1 atom:
-
-    - compact: L1 only
-    - standard: at most Top-1 L0 chunk per L1
-    - detailed: at most Top-3 L0 chunks per L1
+    ``budget_ratio`` is a fraction of the feasible dynamic L1/L0 candidate
+    budget for the current Harbor step. Granularity is intentionally not part
+    of the action space: the deterministic allocator first admits complete L1
+    atoms, then spends any remaining budget on progressively deeper L0 chunks.
     """
 
     budget_ratio: float
-    granularity: MemoryGranularity = "standard"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.budget_ratio <= 1.0:
             raise ValueError("budget_ratio must be in [0, 1]")
-        if self.granularity not in {"compact", "standard", "detailed"}:
-            raise ValueError(f"invalid granularity: {self.granularity}")
 
     @property
     def action_id(self) -> str:
-        return f"budget-{self.budget_ratio:.3f}-{self.granularity}"
+        return f"budget-{self.budget_ratio:.3f}"
 
     def as_runtime_payload(self) -> dict[str, Any]:
         return {
             "kind": "memory_budget_ratio",
             "budget_ratio": self.budget_ratio,
-            "granularity": self.granularity,
-            "one_shot": True,
+            "one_step": True,
         }
