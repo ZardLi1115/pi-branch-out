@@ -15,3 +15,33 @@ jobs:
       - run: python -m pip install -U pip
       - run: python -m pip install -e . pytest
       - run: pytest -q
+
+  tdai-proxy-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pi-branch-out
+        uses: actions/checkout@v4
+        with:
+          path: pi-branch-out
+      - name: Checkout TencentDB-Agent-Memory
+        uses: actions/checkout@v4
+        with:
+          repository: TencentCloud/TencentDB-Agent-Memory
+          ref: feat/server_team
+          path: tdai-memory
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tdai-memory/MemoryProxy/package-lock.json
+      - name: Apply adaptive MemoryProxy patch
+        run: python pi-branch-out/scripts/apply_tdai_proxy_patch.py tdai-memory
+      - name: Install MemoryProxy dependencies
+        working-directory: tdai-memory/MemoryProxy
+        run: npm ci
+      - name: Typecheck patched MemoryProxy
+        working-directory: tdai-memory/MemoryProxy
+        run: npm run typecheck
