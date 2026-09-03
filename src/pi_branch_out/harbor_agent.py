@@ -12,7 +12,19 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 from .checkpoint import CheckpointManifest
+from .observation import BudgetObservation
 from .pi_session import create_checkpoint_session, only_session_file, terminal_entry_id
+
+
+def _parse_bool(value: bool | str) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"invalid boolean value: {value}")
 
 
 class PiTdaiBranchAgent(BaseAgent):
@@ -48,6 +60,7 @@ class PiTdaiBranchAgent(BaseAgent):
         checkpoint_dir: str = "",
         budget_ratio: float | str | None = None,
         branch_control_extension: str = "",
+        require_budget_observation: bool | str = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -58,6 +71,7 @@ class PiTdaiBranchAgent(BaseAgent):
         self.branch_checkpoint = Path(checkpoint_dir).resolve() if checkpoint_dir else None
         self.branch_budget_ratio = float(budget_ratio) if budget_ratio not in (None, "") else None
         self.branch_control_extension = branch_control_extension.strip()
+        self.require_budget_observation = _parse_bool(require_budget_observation)
         self._remote_branch_control_extension = ""
         self._step_index = 0
         self._branch_restored = False
@@ -69,6 +83,10 @@ class PiTdaiBranchAgent(BaseAgent):
     @property
     def _remote_action_file(self) -> PurePosixPath:
         return self.environment_logs_dir / "branch-action.json"
+
+    @property
+    def _remote_observation_file(self) -> PurePosixPath:
+        return self.environment_logs_dir / "tdai-budget-observation.json"
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(f"mkdir -p {shlex.quote(str(self._remote_session_dir))}")
@@ -132,6 +150,8 @@ class PiTdaiBranchAgent(BaseAgent):
         self._step_index += 1
         if self.branch_checkpoint is None:
             await self._capture_pre_action_checkpoint(environment, step_name=f"step-{self._step_index}")
+        # Branch intervention is deliberately one-shot: later Harbor steps do
+        # not receive any budget override environment variable.
         await self._run_pi(
             instruction,
             environment,
@@ -190,8 +210,12 @@ class PiTdaiBranchAgent(BaseAgent):
                 await environment.upload_file(local_action, str(self._remote_action_file))
             finally:
                 local_action.unlink(missing_ok=True)
+
+            await environment.exec(f"rm -f {shlex.quote(str(self._remote_observation_file))}")
             exec_env["PI_BRANCH_OUT_ACTION_FILE"] = str(self._remote_action_file)
             exec_env["TDAI_MEMORY_BUDGET_RATIO_OVERRIDE"] = str(budget_ratio)
+            exec_env["TDAI_MEMORY_BUDGET_OVERRIDE_ONE_SHOT"] = "1"
+            exec_env["TDAI_BRANCH_OUT_OBSERVATION_FILE"] = str(self._remote_observation_file)
 
         argv.append(instruction)
         command = " ".join(shlex.quote(arg) for arg in argv)
@@ -205,6 +229,31 @@ class PiTdaiBranchAgent(BaseAgent):
         )
         if result.return_code != 0:
             raise RuntimeError(f"Pi exited with {result.return_code}: {(result.stderr or '')[-2000:]}")
+
+        if budget_ratio is not None:
+            await self._verify_budget_observation(environment, budget_ratio)
+
+    async def _verify_budget_observation(
+        self,
+        environment: BaseEnvironment,
+        expected_ratio: float,
+    ) -> None:
+        result = await environment.exec(f"cat {shlex.quote(str(self._remote_observation_file))}")
+        if result.return_code != 0 or not (result.stdout or "").strip():
+            if self.require_budget_observation:
+                raise RuntimeError(
+                    "TDAI did not emit a branch budget observation; refusing to keep an unverified branch. "
+                    "Integrate tdai/branch-budget-runtime.ts or pass require_budget_observation=false for wiring-only smoke tests."
+                )
+            return
+
+        raw = result.stdout or ""
+        observation = BudgetObservation.parse(raw)
+        observation.verify(expected_ratio)
+        (self.logs_dir / f"tdai-budget-observation-step-{self._step_index}.json").write_text(
+            raw if raw.endswith("\n") else raw + "\n",
+            encoding="utf-8",
+        )
 
     async def _capture_pre_action_checkpoint(self, environment: BaseEnvironment, *, step_name: str) -> None:
         checkpoint_root = self.logs_dir / "branch-checkpoints" / f"step-{self._step_index:03d}"
@@ -233,6 +282,9 @@ class PiTdaiBranchAgent(BaseAgent):
             pi_source = str(source_session.relative_to(checkpoint_root))
             pi_checkpoint = str(checkpoint_session.relative_to(checkpoint_root))
         except Exception:
+            if self._step_index > 1:
+                raise
+            # Step 1 has no previous Pi session by construction.
             leaf_id = ""
             pi_source = ""
             pi_checkpoint = ""
