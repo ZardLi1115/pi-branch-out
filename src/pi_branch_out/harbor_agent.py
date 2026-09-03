@@ -22,8 +22,8 @@ class PiTdaiBranchAgent(BaseAgent):
     Harbor step. A checkpoint contains the current workspace, the Pi session
     ending before the new user instruction, and optional local TDAI state.
 
-    Branch mode restores one checkpoint, forks the native Pi session, and
-    applies a Memory budget override to the first resumed step only.
+    Branch mode restores one checkpoint, forks the native Pi session when one
+    exists, and applies a Memory budget override to the first resumed step only.
     """
 
     capabilities = AgentCapabilities(resume=True)
@@ -57,6 +57,7 @@ class PiTdaiBranchAgent(BaseAgent):
         self.branch_checkpoint = Path(checkpoint_dir).resolve() if checkpoint_dir else None
         self.branch_budget_ratio = float(budget_ratio) if budget_ratio not in (None, "") else None
         self.branch_control_extension = branch_control_extension.strip()
+        self._remote_branch_control_extension = ""
         self._step_index = 0
 
     @property
@@ -69,6 +70,16 @@ class PiTdaiBranchAgent(BaseAgent):
 
     async def setup(self, environment: BaseEnvironment) -> None:
         await environment.exec(f"mkdir -p {shlex.quote(str(self._remote_session_dir))}")
+        if self.branch_control_extension:
+            local_bridge = Path(self.branch_control_extension)
+            if local_bridge.is_file():
+                remote_bridge = self.environment_logs_dir / "tdai-budget-override.ts"
+                await environment.upload_file(local_bridge, str(remote_bridge))
+                self._remote_branch_control_extension = str(remote_bridge)
+            else:
+                # Also allow an extension path that is already visible inside
+                # the Harbor environment.
+                self._remote_branch_control_extension = self.branch_control_extension
         if self.branch_checkpoint is not None:
             await self._restore_checkpoint(environment, self.branch_checkpoint)
 
@@ -92,9 +103,11 @@ class PiTdaiBranchAgent(BaseAgent):
             return
 
         manifest = CheckpointManifest.load(self.branch_checkpoint / "checkpoint.json")
-        if not manifest.pi_checkpoint_session:
-            raise ValueError("selected checkpoint has no prior Pi session and cannot be forked")
-        checkpoint_session = self.branch_checkpoint / manifest.pi_checkpoint_session
+        checkpoint_session = (
+            self.branch_checkpoint / manifest.pi_checkpoint_session
+            if manifest.pi_checkpoint_session
+            else None
+        )
         await self._run_pi(
             instruction,
             environment,
@@ -154,8 +167,8 @@ class PiTdaiBranchAgent(BaseAgent):
             argv.extend(["--fork", str(remote_fork)])
 
         extensions = list(self.pi_extensions)
-        if budget_ratio is not None and self.branch_control_extension:
-            extensions.insert(0, self.branch_control_extension)
+        if budget_ratio is not None and self._remote_branch_control_extension:
+            extensions.insert(0, self._remote_branch_control_extension)
         for extension in extensions:
             argv.extend(["--extension", extension])
 
@@ -175,12 +188,9 @@ class PiTdaiBranchAgent(BaseAgent):
                 local_action.unlink(missing_ok=True)
             exec_env["PI_BRANCH_OUT_ACTION_FILE"] = str(self._remote_action_file)
             # A patched TDAI adapter can consume this variable directly. The
-            # bridge extension in this repository exposes the same value.
+            # bridge extension exposes the same value inside Pi.
             exec_env["TDAI_MEMORY_BUDGET_RATIO_OVERRIDE"] = str(budget_ratio)
 
-        # Pi print mode accepts the prompt as its final argv item. Avoid stdin:
-        # Harbor's BaseEnvironment.exec contract does not expose stdin uniformly
-        # across providers.
         argv.append(instruction)
         command = " ".join(shlex.quote(arg) for arg in argv)
         result = await environment.exec(command, env=exec_env or None)
@@ -221,8 +231,8 @@ class PiTdaiBranchAgent(BaseAgent):
             pi_source = str(source_session.relative_to(checkpoint_root))
             pi_checkpoint = str(checkpoint_session.relative_to(checkpoint_root))
         except Exception:
-            # Step 1 normally has no previous Pi message yet. The checkpoint is
-            # still useful as an initial workspace snapshot, but cannot be forked.
+            # Step 1 normally has no previous Pi message yet. It is still a
+            # valid branch point: branch mode simply starts a fresh Pi session.
             leaf_id = ""
             pi_source = ""
             pi_checkpoint = ""
