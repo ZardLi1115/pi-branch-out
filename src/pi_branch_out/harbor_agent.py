@@ -5,6 +5,7 @@ import shlex
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any
+from uuid import uuid4
 
 from harbor.agents.base import BaseAgent
 from harbor.agents.capabilities import AgentCapabilities
@@ -27,6 +28,13 @@ def _parse_bool(value: bool | str) -> bool:
     raise ValueError(f"invalid boolean value: {value}")
 
 
+def _parse_granularity(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in {"compact", "standard", "detailed"}:
+        raise ValueError(f"invalid memory granularity: {value}")
+    return normalized
+
+
 class PiTdaiBranchAgent(BaseAgent):
     """Harbor agent that keeps one native Pi session across multi-step tasks.
 
@@ -35,7 +43,7 @@ class PiTdaiBranchAgent(BaseAgent):
     ending before the new user instruction, and optional local TDAI state.
 
     Branch mode restores one checkpoint at the same pre-action boundary, forks
-    the native Pi session when one exists, and applies a Memory budget override
+    the native Pi session when one exists, and applies one adaptive Memory action
     to the first resumed step only.
     """
 
@@ -46,7 +54,7 @@ class PiTdaiBranchAgent(BaseAgent):
         return "pi-tdai-branch"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def __init__(
         self,
@@ -59,6 +67,7 @@ class PiTdaiBranchAgent(BaseAgent):
         tdai_state_dir: str = "",
         checkpoint_dir: str = "",
         budget_ratio: float | str | None = None,
+        memory_granularity: str = "standard",
         branch_control_extension: str = "",
         require_budget_observation: bool | str = True,
         **kwargs: Any,
@@ -70,6 +79,7 @@ class PiTdaiBranchAgent(BaseAgent):
         self.tdai_state_dir = tdai_state_dir.strip()
         self.branch_checkpoint = Path(checkpoint_dir).resolve() if checkpoint_dir else None
         self.branch_budget_ratio = float(budget_ratio) if budget_ratio not in (None, "") else None
+        self.memory_granularity = _parse_granularity(memory_granularity)
         self.branch_control_extension = branch_control_extension.strip()
         self.require_budget_observation = _parse_bool(require_budget_observation)
         self._remote_branch_control_extension = ""
@@ -115,13 +125,10 @@ class PiTdaiBranchAgent(BaseAgent):
                 resume=False,
                 fork_session=None,
                 budget_ratio=None,
+                granularity="standard",
             )
             return
 
-        # Harbor calls agent.setup() before the current step's workdir/setup.sh,
-        # while natural checkpoints are captured after _prepare_step and just
-        # before the agent sees the new instruction. Restore here, not setup(),
-        # so branch and natural runs start from the same pre-action state.
         if not self._branch_restored:
             await self._restore_checkpoint(environment, self.branch_checkpoint)
             self._branch_restored = True
@@ -139,6 +146,7 @@ class PiTdaiBranchAgent(BaseAgent):
             resume=False,
             fork_session=checkpoint_session,
             budget_ratio=self.branch_budget_ratio,
+            granularity=self.memory_granularity,
         )
 
     async def resume(
@@ -150,8 +158,6 @@ class PiTdaiBranchAgent(BaseAgent):
         self._step_index += 1
         if self.branch_checkpoint is None:
             await self._capture_pre_action_checkpoint(environment, step_name=f"step-{self._step_index}")
-        # Branch intervention is deliberately one-shot: later Harbor steps do
-        # not receive any budget override environment variable.
         await self._run_pi(
             instruction,
             environment,
@@ -159,6 +165,7 @@ class PiTdaiBranchAgent(BaseAgent):
             resume=True,
             fork_session=None,
             budget_ratio=None,
+            granularity="standard",
         )
 
     async def _run_pi(
@@ -170,6 +177,7 @@ class PiTdaiBranchAgent(BaseAgent):
         resume: bool,
         fork_session: Path | None,
         budget_ratio: float | None,
+        granularity: str,
     ) -> None:
         argv = [
             self.pi_executable,
@@ -197,10 +205,13 @@ class PiTdaiBranchAgent(BaseAgent):
             argv.extend(["--extension", extension])
 
         exec_env: dict[str, str] = {}
+        observation_id: str | None = None
         if budget_ratio is not None:
+            observation_id = uuid4().hex
             payload = {
                 "kind": "memory_budget_ratio",
                 "budget_ratio": budget_ratio,
+                "granularity": granularity,
                 "one_shot": True,
             }
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
@@ -214,8 +225,10 @@ class PiTdaiBranchAgent(BaseAgent):
             await environment.exec(f"rm -f {shlex.quote(str(self._remote_observation_file))}")
             exec_env["PI_BRANCH_OUT_ACTION_FILE"] = str(self._remote_action_file)
             exec_env["TDAI_MEMORY_BUDGET_RATIO_OVERRIDE"] = str(budget_ratio)
+            exec_env["TDAI_MEMORY_GRANULARITY_OVERRIDE"] = granularity
             exec_env["TDAI_MEMORY_BUDGET_OVERRIDE_ONE_SHOT"] = "1"
             exec_env["TDAI_BRANCH_OUT_OBSERVATION_FILE"] = str(self._remote_observation_file)
+            exec_env["TDAI_BRANCH_OUT_OBSERVATION_ID"] = observation_id
 
         argv.append(instruction)
         command = " ".join(shlex.quote(arg) for arg in argv)
@@ -230,26 +243,60 @@ class PiTdaiBranchAgent(BaseAgent):
         if result.return_code != 0:
             raise RuntimeError(f"Pi exited with {result.return_code}: {(result.stderr or '')[-2000:]}")
 
-        if budget_ratio is not None:
-            await self._verify_budget_observation(environment, budget_ratio)
+        if budget_ratio is not None and observation_id is not None:
+            await self._verify_budget_observation(
+                environment,
+                expected_ratio=budget_ratio,
+                expected_granularity=granularity,
+                observation_id=observation_id,
+            )
+
+    async def _read_proxy_observation(
+        self,
+        environment: BaseEnvironment,
+        observation_id: str,
+    ) -> str:
+        proxy = await environment.exec("printenv TDAI_PROXY_URL")
+        proxy_url = (proxy.stdout or "").strip().rstrip("/")
+        if proxy.return_code != 0 or not proxy_url:
+            return ""
+        url = f"{proxy_url}/__branch_out/observations/{observation_id}"
+        fetched = await environment.exec(
+            f"curl -fsS --max-time 10 {shlex.quote(url)}"
+        )
+        if fetched.return_code != 0:
+            return ""
+        return fetched.stdout or ""
 
     async def _verify_budget_observation(
         self,
         environment: BaseEnvironment,
+        *,
         expected_ratio: float,
+        expected_granularity: str,
+        observation_id: str,
     ) -> None:
-        result = await environment.exec(f"cat {shlex.quote(str(self._remote_observation_file))}")
-        if result.return_code != 0 or not (result.stdout or "").strip():
+        # In-process TDAI writes directly to the shared agent log path.
+        local = await environment.exec(f"cat {shlex.quote(str(self._remote_observation_file))}")
+        raw = (local.stdout or "") if local.return_code == 0 else ""
+
+        # Pi's current official TDAI adapter uses MemoryProxy. In that mode the
+        # proxy is a different process, so retrieve the observation through the
+        # experiment-only rendezvous endpoint instead of assuming a shared FS.
+        if not raw.strip():
+            raw = await self._read_proxy_observation(environment, observation_id)
+
+        if not raw.strip():
             if self.require_budget_observation:
                 raise RuntimeError(
                     "TDAI did not emit a branch budget observation; refusing to keep an unverified branch. "
-                    "Integrate tdai/branch-budget-runtime.ts or pass require_budget_observation=false for wiring-only smoke tests."
+                    "Apply the MemoryProxy branch-out patch and set TDAI_BRANCH_OUT_ENABLED=1, or pass "
+                    "require_budget_observation=false for wiring-only smoke tests."
                 )
             return
 
-        raw = result.stdout or ""
         observation = BudgetObservation.parse(raw)
-        observation.verify(expected_ratio)
+        observation.verify(expected_ratio, expected_granularity)
         (self.logs_dir / f"tdai-budget-observation-step-{self._step_index}.json").write_text(
             raw if raw.endswith("\n") else raw + "\n",
             encoding="utf-8",
@@ -284,7 +331,6 @@ class PiTdaiBranchAgent(BaseAgent):
         except Exception:
             if self._step_index > 1:
                 raise
-            # Step 1 has no previous Pi session by construction.
             leaf_id = ""
             pi_source = ""
             pi_checkpoint = ""
