@@ -29,6 +29,15 @@ class CheckpointManifest:
     workspace_base_commit: str | None = None
     workspace_patch: str | None = None
     workspace_untracked_archive: str | None = None
+    snapshot_sha256: str | None = None
+    allocator_version: str = "complete-render-v2"
+    tokenizer_version: str = "tdai-estimator-v2-complete-render"
+    action_table_version: str = "budget-ratios-v1"
+    policy_version: str = "baseline-v1"
+    backend_snapshot_status: str = "not-captured"
+    backend_isolation_mode: str = "shared"
+    backend_instance_id: str | None = None
+    backend_proxy_sha256: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointManifest":

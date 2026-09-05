@@ -20,10 +20,23 @@ def test_conversation_id_extension_rewrites_provider_headers() -> None:
     text = EXTENSION.read_text(encoding="utf-8")
     code = _code_without_comments(text)
     assert 'headers["x-conversation-id"]' in code
+    assert 'headers["session-id"]' in code
     assert 'pi.on("session_start"' in code
     assert 'pi.on("before_agent_start"' in code
     assert "pi.registerProvider" in code
+    assert 'wireApi === "responses"' in code
+    assert 'api: wireApi === "responses" ? "openai-responses"' in code
+    assert 'type: "message"' in code
     assert 'pi.on("before_provider_headers"' not in code
+
+
+def test_responses_bridge_queries_use_codex_composite_key() -> None:
+    collector = (ROOT / "extensions" / "tdai-model-call-collector.ts").read_text(encoding="utf-8")
+    policy = (ROOT / "extensions" / "tdai-budget-policy.ts").read_text(encoding="utf-8")
+    agent = AGENT.read_text(encoding="utf-8")
+    assert "`codex:${conversationId}`" in collector
+    assert "`codex:${conversationId}`" in policy
+    assert 'f"codex:{conversation_id}"' in agent
 
 
 def test_harbor_agent_uploads_conversation_id_extension() -> None:

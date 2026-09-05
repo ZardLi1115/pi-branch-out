@@ -1,4 +1,5 @@
-FROM node:22-bookworm-slim AS builder
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE} AS builder
 
 ARG PI_VERSION=0.73.1
 RUN npm install --global --prefix /opt/pi-runtime --ignore-scripts \
@@ -8,3 +9,9 @@ RUN npm install --global --prefix /opt/pi-runtime --ignore-scripts \
 
 FROM scratch AS export
 COPY --from=builder /opt/pi-runtime/ /pi-runtime/
+
+FROM builder AS pack
+RUN tar -C /opt -czf /pi-runtime.tar.gz pi-runtime
+
+FROM scratch AS archive
+COPY --from=pack /pi-runtime.tar.gz /pi-runtime.tar.gz

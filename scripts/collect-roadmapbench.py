@@ -7,6 +7,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import time
 import tomllib
 from pathlib import Path
 
@@ -68,9 +69,14 @@ def validate_natural(jobs_dir: Path, task_name: str) -> dict:
     ]
     if not states:
         raise RuntimeError(f"no model calls recorded for {task_name}")
-    not_ready = [row for row in states[1:] if row.get("recall_snapshot_status") != "ready"]
-    if not_ready:
-        raise RuntimeError(f"{task_name} has {len(not_ready)} non-ready checkpoints")
+    probe_errors = [row for row in states if row.get("checkpoint_status") == "probe-error"]
+    if probe_errors:
+        raise RuntimeError(f"{task_name} has {len(probe_errors)} failed candidate probes")
+    saved = [row for row in states if row.get("checkpoint_status") == "ready"]
+    if len(saved) > 2:
+        raise RuntimeError(f"{task_name} exceeded the checkpoint quota: {len(saved)}")
+    if any(row.get("recall_snapshot_status") != "ready" for row in saved):
+        raise RuntimeError(f"{task_name} saved a checkpoint without a ready recall snapshot")
 
     stderr_bytes = sum(
         item.stat().st_size for item in (path.parent / "agent").glob("pi-step-*.stderr.txt")
@@ -94,9 +100,17 @@ def validate_natural(jobs_dir: Path, task_name: str) -> dict:
         "trial_result": str(path),
         "reward": rewards.get("reward"),
         "model_calls": len(states),
-        "ready_checkpoints": len(states) - 1,
+        "ready_checkpoints": len(saved),
         "verifier_compat_error": verifier_compat_error,
     }
+    final_reward = rewards.get("reward")
+    for checkpoint_manifest in (path.parent / "agent/model-call-checkpoints").glob("call-*/checkpoint.json"):
+        value = json.loads(checkpoint_manifest.read_text(encoding="utf-8"))
+        value["source_reward"] = final_reward
+        value["source_trial_dir"] = str(path.parent)
+        checkpoint_manifest.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     print(f"[roadmapbench-collector] Natural ready: {json.dumps(summary)}", flush=True)
     return summary
 
@@ -204,6 +218,20 @@ def main() -> int:
             ]
         )
         validate_prebuild(prebuild_jobs, task_name)
+
+        initial_score = args.output_root / "initial-scores" / f"{task_name}.json"
+        if not initial_score.is_file():
+            run(
+                [
+                    "/opt/anaconda3/bin/pi-branch-out",
+                    "score-initial",
+                    "--task", str(task_dir),
+                    "--output-root", str(args.output_root / "initial-score-jobs" / task_name / str(time.time_ns())),
+                    "--score-output", str(initial_score),
+                    "--model", args.model,
+                    "--harbor-bin", "/opt/anaconda3/bin/harbor",
+                ]
+            )
 
         try:
             summary = validate_natural(natural_jobs, task_name)

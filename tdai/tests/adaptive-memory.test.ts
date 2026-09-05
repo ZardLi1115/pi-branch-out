@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { decideMemoryBudget } from "../memory-budget-controller.ts";
-import { allocateProgressiveMemory } from "../progressive-memory-allocator.ts";
+import { allocateProgressiveMemory, renderProgressiveMemory } from "../progressive-memory-allocator.ts";
+import { chooseRatio, policyFeatures } from "../../extensions/tdai-budget-policy.ts";
+import { deterministicSample } from "../../extensions/tdai-model-call-collector.ts";
 
 test("branch ratio scales candidate-aware feasible budget", () => {
   const decision = decideMemoryBudget({
@@ -68,4 +70,58 @@ test("duplicate L0 ids are injected once", () => {
   });
   const ids = result.selected.flatMap((item) => item.selectedL0.map((chunk) => chunk.id));
   assert.equal(ids.filter((id) => id === "shared").length, 1);
+});
+
+test("complete rendered block is recounted and never exceeds budget", () => {
+  const candidates = [
+    { id: "a", content: "alpha", tokenCount: 1, l0: [] },
+    { id: "b", content: "beta", tokenCount: 1, l0: [] },
+  ];
+  const countRenderedTokens = (value: string) => value.length;
+  const full = allocateProgressiveMemory({
+    budgetTokens: 10_000, candidates, countRenderedTokens,
+  });
+  const constrained = allocateProgressiveMemory({
+    budgetTokens: full.injectedTokens - 1, candidates, countRenderedTokens,
+  });
+  assert.deepEqual(full.selected.map((item) => item.id), ["a", "b"]);
+  assert.deepEqual(constrained.selected.map((item) => item.id), ["a"]);
+  assert.equal(constrained.injectedTokens, renderProgressiveMemory(constrained).length);
+  assert.ok(constrained.injectedTokens <= full.injectedTokens - 1);
+});
+
+test("unrelated L0 remains standalone evidence and survives without L1", () => {
+  const result = allocateProgressiveMemory({
+    budgetTokens: 10_000,
+    candidates: [],
+    independentL0: [{ id: "history", content: "old evidence", tokenCount: 2, retrievalIndex: 0 }],
+    countRenderedTokens: (value) => value.length,
+  });
+  assert.deepEqual(result.selectedIndependentL0.map((item) => item.id), ["history"]);
+  assert.match(renderProgressiveMemory(result), /独立历史证据/);
+});
+
+test("frozen MLP policy emits one of the fixed budget actions", () => {
+  const inputDimension = 14 + 16 + 128;
+  const policy = {
+    schema_version: 1,
+    feature_version: "visible-state-hash-v3-history",
+    hash_dim: 128,
+    actions: [0, 0.5, 1],
+    w1: Array.from({ length: inputDimension }, () => [0]),
+    b1: [0],
+    w2: [[0, 0, 0]],
+    b2: [0, 2, 1],
+  };
+  const state = { query: "fix parser", recent_tool_result: "one test failed" };
+  assert.equal(policyFeatures(state, policy).length, inputDimension);
+  assert.equal(chooseRatio(policy, state).ratio, 0.5);
+});
+
+test("checkpoint sampling is deterministic and bounded", () => {
+  const first = deterministicSample("task", "batch", 17);
+  const second = deterministicSample("task", "batch", 17);
+  assert.equal(first, second);
+  assert.ok(first >= 0 && first < 1);
+  assert.notEqual(first, deterministicSample("task", "batch", 18));
 });

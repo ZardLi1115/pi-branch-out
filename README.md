@@ -1,6 +1,6 @@
 # pi-branch-out
 
-用于 **Pi + TDAI Memory + Harbor / EvoCodeBench** 的结构化 Branch-out 数据采集。
+用于 **Pi + TDAI Memory + Harbor / RoadmapBench** 的结构化 Branch-out 数据采集。仓库中的 EvoCodeBench 目录仅保留为多 step 接线示例，不进入预算策略训练或正式评测。
 
 这套代码有一个硬边界：**不修改 TencentDB-Agent-Memory、MemoryCore 或 MemoryProxy 源码。** TDAI 只作为现成服务使用。我们通过官方 Pi 插件走 TDAI Proxy，并通过现有只读 `memory-bridge` 冻结 L1/L0 候选；Budget Controller、上下文分配和 Branch-out 全部发生在本仓库与 Pi extension 侧。
 
@@ -43,7 +43,9 @@ feasible_budget = min(
 budget = budget_ratio × feasible_budget
 ```
 
-具体 Memory 如何装入是确定性的：先按 TDAI 召回顺序放完整 L1；剩余预算再对已选 L1 逐层、轮流补 L0，直到预算或 L0 用完。没有单独的“展开粒度”动作。
+具体 Memory 如何装入是确定性的：先按 TDAI 召回顺序放完整 L1；剩余预算继续按原始检索顺序补 L0。只有后端返回明确 L1 外键的 L0 才嵌套到该 L1；没有明确关系的 L0 会作为独立历史证据保留，绝不会仅因同属一个 Agent 被强行挂接。没有单独的“展开粒度”动作。
+
+预算按完整 `<tdai_recalled_memories>` 渲染块计数，包含包装、序号、来源、score、role 和消息拼接开销。每次增删完整片段后重新计数；最终渲染超过 Budget 会直接失败，日志不再用截小计数掩盖溢出。Natural checkpoint 还会预演固定动作表并记录每档内容 SHA-256；`branch-grid` 在调用模型前合并内容相同的等价动作。
 
 ## 安装
 
@@ -83,6 +85,17 @@ export TDAI_AGENT_ID="<agent>"
 export TDAI_USER_KEY="<user-key>"
 export TDAI_MODEL="<model>"
 ```
+
+Responses API custom provider 还需设置：
+
+```bash
+export TDAI_AGENT_SOURCE="codex"
+export TDAI_WIRE_API="responses"
+```
+
+本仓库的 conversation-id extension 会同时补齐 Codex sessionInit、memory-bridge
+热/冷恢复和 L0 recorder 所需的 Responses 兼容字段；详见
+`docs/closed-loop-implementation.md`。
 
 `TDAI_TASK_ID` 对 memory 来说可选；但若 Proxy 开了 `sessionInit`，没有 task 时第一次 LLM 调用会被劫持成 `ask_followup_question` 表单（`content=None`）。采集时建议创建一个真实 task 并设置 `TDAI_TASK_ID`。
 
@@ -142,9 +155,13 @@ oracle` 跑一遍数据集，将 115 个官方任务镜像拉取/构建进本机
 
 Harbor 会把数据集根目录展开为全部任务。每个 trial 的
 `agent/model-call-checkpoints/model-call-states.jsonl` 记录所有模型调用；从
-`call-002/` 起保存可恢复的 Pi leaf id、冻结 recall snapshot，以及相对任务初始
-commit 的 workspace binary diff / 未跟踪文件包。所有点共享 Pi 最终的 append-only
-session 文件，避免为每个调用复制一遍不断增长的 transcript。
+`call-002` 起按限额抽样。每次调用都写轻量账本；只有抽中后才查询候选，并且只有
+固定预算表产生至少两种实际内容时，才保存可恢复的 Pi leaf id、冻结 recall
+snapshot，以及相对任务初始 commit 的 workspace binary diff / 未跟踪文件包。
+默认每任务最多 2 个断点、最小间隔 10 次调用、抽样概率 10%、最多候选探测 8 次。
+所有保存点共享 Pi 最终的 append-only session 文件。可通过
+`--max-checkpoints`、`--min-checkpoint-gap`、`--sample-probability`、
+`--max-candidate-probes` 和 `--sampling-batch` 固定同批采集行为。
 
 从这些 checkpoint 启动 `branch` 或 `branch-grid` 时，采集器通过 Pi 官方 SDK 的
 `Agent.continue()` 恢复 tool loop，不会再次添加 roadmap 用户消息。没有
@@ -169,6 +186,8 @@ Branch 会：
 → 一直跑到任务结束
 ```
 
+冻结候选只能保证第一次分配一致，不能隔离后续 TDAI 查询和写入。因此长程 Branch 默认 fail-closed：必须传入一个与 Natural 不同的独立 TDAI Proxy URL；多个有效动作的 `branch-grid` 必须用 `{run_id}` URL/实例模板，让每条分支落到不同后端。共享后端只允许显式开启非训练局部测试，导出器不会把它标为可训练长程反事实。腾讯当前仓库没有 L0/L1 数据面的 snapshot/restore API，本仓库不会假装已经恢复后端。
+
 ## 一次跑多个 Budget
 
 ```bash
@@ -178,6 +197,9 @@ pi-branch-out branch-grid \
   --ratios 0,0.2,0.4,0.6,0.8,1.0 \
   --output-root ./branch_runs \
   --model tdai/<model> \
+  --tdai-isolation-mode isolated-instance \
+  --backend-instance-id 'tdai-{run_id}' \
+  --backend-proxy-url 'http://tdai-{run_id}:8096' \
   --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
 ```
 
@@ -221,6 +243,22 @@ Branch override > MLP policy > baseline
 ```
 
 确定性的 Recall Snapshot、Budget Controller 和 L1/L0 allocator 不需要改。
+
+## RoadmapBench 闭环命令
+
+稳定划分、节点选择、官方隔离评分、数据导出、CQL 训练和冻结评测已作为独立命令提供。默认标签与真实动作 transition 分别写入不同 JSONL；缺终局分、缺分叉阶段分、缺实际账单或使用共享 TDAI 后端的轨迹不会进入 CQL。
+
+```text
+pi-branch-out split-roadmapbench ...
+pi-branch-out select-checkpoints ...
+pi-branch-out score-initial ...
+pi-branch-out score-checkpoint ...
+pi-branch-out export-training ...
+pi-branch-out train-policy ...
+pi-branch-out summarize-evaluation ...
+```
+
+完整字段合同和推荐顺序见 `docs/closed-loop-implementation.md`。正式 Harbor/TDAI 启动与冒烟应通过外部 `wake-run` 执行；单元测试不需要启动 benchmark。
 
 ## 测试
 

@@ -4,19 +4,22 @@ import { decideMemoryBudget } from "../tdai/memory-budget-controller.js";
 import { allocateProgressiveMemory, renderProgressiveMemory, type L1Candidate } from "../tdai/progressive-memory-allocator.js";
 
 type ExtensionAPI = { on(event: string, callback: (event: any, ctx: any) => unknown): void };
-type SearchHit = {
+export type SearchHit = {
   id?: unknown; type?: unknown; content?: unknown; score?: unknown; role?: unknown;
   session_id?: unknown; source_agent_id?: unknown; source_agent_name?: unknown;
+  parent_id?: unknown; parent_l1_id?: unknown; atomic_id?: unknown; memory_id?: unknown;
+  source_memory_id?: unknown;
 };
-type Snapshot = {
+export type Snapshot = {
   version: number;
   query: string;
+  model_call_index?: number;
   atomic_search: unknown;
   conversation_search: unknown;
   baseline?: Record<string, unknown>;
 };
 
-function textOfContent(content: unknown): string {
+export function textOfContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content);
   return content.map((part) => {
@@ -27,7 +30,7 @@ function textOfContent(content: unknown): string {
   }).filter(Boolean).join("\n");
 }
 
-function estimateTextTokens(text: string): number {
+export function estimateTextTokens(text: string): number {
   if (!text) return 0;
   let cjk = 0;
   for (const ch of text) {
@@ -37,8 +40,15 @@ function estimateTextTokens(text: string): number {
   return Math.max(1, Math.ceil(cjk / 1.7 + Math.max(0, text.length - cjk) / 4));
 }
 
-function estimateMessagesTokens(messages: any[]): number {
+export function estimateMessagesTokens(messages: any[]): number {
   return messages.reduce((sum, m) => sum + estimateTextTokens(`${String(m?.role ?? "")}\n${textOfContent(m?.content)}`) + 4, 0);
+}
+
+export function estimateContextTokens(event: any): number {
+  const messages = Array.isArray(event?.messages) ? event.messages : [];
+  const system = textOfContent(event?.systemPrompt ?? event?.system ?? "");
+  const tools = Array.isArray(event?.tools) ? JSON.stringify(event.tools) : "";
+  return estimateMessagesTokens(messages) + estimateTextTokens(system) + estimateTextTokens(tools) + 8;
 }
 
 function rows(value: unknown, key: "items" | "messages"): SearchHit[] {
@@ -47,7 +57,14 @@ function rows(value: unknown, key: "items" | "messages"): SearchHit[] {
   return Array.isArray(list) ? list as SearchHit[] : [];
 }
 
-function toCandidates(snapshot: Snapshot): L1Candidate[] {
+function explicitParentId(row: SearchHit): string | undefined {
+  for (const value of [row.parent_l1_id, row.atomic_id, row.memory_id, row.source_memory_id, row.parent_id]) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+export function toCandidates(snapshot: Snapshot): { candidates: L1Candidate[]; independentL0: import("../tdai/progressive-memory-allocator.js").L0Candidate[] } {
   const l1 = rows(snapshot.atomic_search, "items").flatMap((row) => {
     const id = typeof row.id === "string" ? row.id : "";
     const content = typeof row.content === "string" ? row.content : "";
@@ -60,37 +77,31 @@ function toCandidates(snapshot: Snapshot): L1Candidate[] {
     return [{ id, content, type, score, fromAgentId, fromAgentName, tokenCount: estimateTextTokens(rendered), l0: [] }];
   });
 
-  const byAgent = new Map<string, L1Candidate[]>();
-  for (const candidate of l1) {
-    const key = candidate.fromAgentId ?? "__unknown__";
-    const list = byAgent.get(key) ?? [];
-    list.push(candidate);
-    byAgent.set(key, list);
-  }
-  const next = new Map<string, number>();
-  for (const row of rows(snapshot.conversation_search, "messages")) {
+  const byId = new Map(l1.map((candidate) => [candidate.id, candidate]));
+  const independentL0: import("../tdai/progressive-memory-allocator.js").L0Candidate[] = [];
+  rows(snapshot.conversation_search, "messages").forEach((row, retrievalIndex) => {
     const id = typeof row.id === "string" ? row.id : "";
     const content = typeof row.content === "string" ? row.content : "";
-    if (!id || !content) continue;
-    const key = typeof row.source_agent_id === "string" ? row.source_agent_id : "__unknown__";
-    const targets = byAgent.get(key);
-    if (!targets?.length) continue;
-    const idx = next.get(key) ?? 0;
-    const target = targets[idx % targets.length];
-    next.set(key, idx + 1);
-    target.l0.push({
+    if (!id || !content) return;
+    const parentL1Id = explicitParentId(row);
+    const chunk = {
       id,
       content,
       score: typeof row.score === "number" ? row.score : undefined,
       role: typeof row.role === "string" ? row.role : undefined,
       sessionId: typeof row.session_id === "string" ? row.session_id : undefined,
       tokenCount: estimateTextTokens(`[L0] ${content}`),
-    });
-  }
-  return l1;
+      retrievalIndex,
+      parentL1Id,
+    };
+    const parent = parentL1Id ? byId.get(parentL1Id) : undefined;
+    if (parent) parent.l0.push(chunk);
+    else independentL0.push(chunk);
+  });
+  return { candidates: l1, independentL0 };
 }
 
-function prependToLatestUser(messages: any[], block: string): any[] {
+export function prependToLatestUser(messages: any[], block: string): any[] {
   if (!block) return messages;
   const cloned = [...messages];
   for (let i = cloned.length - 1; i >= 0; i -= 1) {
@@ -115,36 +126,49 @@ export default function tdaiBudgetOverride(pi: ExtensionAPI): void {
   if (action.kind !== "memory_budget_ratio" || !Number.isFinite(ratio) || ratio < 0 || ratio > 1) {
     throw new Error("invalid branch budget action");
   }
-  const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as Snapshot;
-  const candidates = toCandidates(snapshot);
-  const candidateTokens = candidates.reduce(
-    (sum, item) => sum + item.tokenCount + item.l0.reduce((s, chunk) => s + chunk.tokenCount, 0),
-    0,
-  );
+  const snapshotText = readFileSync(snapshotPath, "utf8");
+  const snapshot = JSON.parse(snapshotText) as Snapshot;
+  const { candidates, independentL0 } = toCandidates(snapshot);
+  const snapshotFingerprint = createHash("sha256").update(snapshotText).digest("hex");
   const observationPath = process.env.PI_BRANCH_OUT_OBSERVATION_FILE;
   let applied = false;
 
   pi.on("context", async (event: any, ctx: any) => {
     if (applied || ctx?.model?.provider !== "tdai") return;
     const messages = Array.isArray(event?.messages) ? event.messages : [];
+    const currentContextTokens = estimateContextTokens(event);
+    const countRenderedTokens = (block: string): number => {
+      if (!block) return 0;
+      return Math.max(0, estimateMessagesTokens(prependToLatestUser(messages, block)) - estimateMessagesTokens(messages));
+    };
+    const fullAllocation = allocateProgressiveMemory({
+      candidates,
+      independentL0,
+      budgetTokens: Number.MAX_SAFE_INTEGER,
+      countRenderedTokens,
+    });
+    const candidateTokens = fullAllocation.injectedTokens;
     const contextWindow = Number(ctx?.model?.contextWindow ?? 524288);
     const reserveRaw = Number(process.env.TDAI_MEMORY_RESERVE_TOKENS ?? 16384);
     const hardCapRaw = Number(process.env.TDAI_MEMORY_HARD_CAP_TOKENS ?? 0);
     const decision = decideMemoryBudget({
       branchRatio: ratio,
       contextWindowTokens: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 524288,
-      currentContextTokens: estimateMessagesTokens(messages),
+      currentContextTokens,
       reserveTokens: Number.isFinite(reserveRaw) && reserveRaw >= 0 ? reserveRaw : 16384,
       candidateTokens,
       hardCapTokens: Number.isFinite(hardCapRaw) && hardCapRaw > 0 ? hardCapRaw : null,
     });
-    const wrapperReserve = Math.min(64, decision.budgetTokens);
     const allocation = allocateProgressiveMemory({
       candidates,
-      budgetTokens: Math.max(0, decision.budgetTokens - wrapperReserve),
+      independentL0,
+      budgetTokens: decision.budgetTokens,
+      countRenderedTokens,
     });
     const block = renderProgressiveMemory(allocation);
-    const injectedTokens = block ? Math.min(decision.budgetTokens, estimateTextTokens(block)) : 0;
+    const injectedTokens = allocation.injectedTokens;
+    if (injectedTokens > decision.budgetTokens) throw new Error("rendered injection exceeded the selected budget");
+    const contentSha256 = createHash("sha256").update(block).digest("hex");
     const observation = {
       kind: "memory_budget_ratio",
       requested_ratio: decision.requestedRatio,
@@ -153,11 +177,20 @@ export default function tdaiBudgetOverride(pi: ExtensionAPI): void {
       feasible_budget_tokens: decision.feasibleBudgetTokens,
       budget_tokens: decision.budgetTokens,
       injected_tokens: injectedTokens,
-      injected_content_sha256: createHash("sha256").update(block).digest("hex"),
+      injected_content_sha256: contentSha256,
+      effective_action_id: `sha256:${contentSha256}`,
       l1_ids: allocation.selected.map((item) => item.id),
-      l0_ids: allocation.selected.flatMap((item) => item.selectedL0.map((chunk) => chunk.id)),
-      snapshot_id: `${snapshot.version}:${snapshot.query}`,
+      l0_ids: [
+        ...allocation.selected.flatMap((item) => item.selectedL0.map((chunk) => chunk.id)),
+        ...allocation.selectedIndependentL0.map((chunk) => chunk.id),
+      ],
+      independent_l0_ids: allocation.selectedIndependentL0.map((chunk) => chunk.id),
+      snapshot_id: `sha256:${snapshotFingerprint}`,
+      tokenizer_version: "tdai-estimator-v2-complete-render",
+      context_tokens_before_injection: currentContextTokens,
+      context_tokens_after_injection: currentContextTokens + injectedTokens,
       adapter: "pi-frozen-recall-context-hook",
+      model_call_index: snapshot.model_call_index ?? null,
     };
     if (observationPath) writeFileSync(observationPath, `${JSON.stringify(observation, null, 2)}\n`, "utf8");
     applied = true;

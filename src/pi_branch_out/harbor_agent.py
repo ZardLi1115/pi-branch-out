@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shlex
 import tempfile
@@ -25,8 +26,10 @@ _TDAI_ENV_KEYS = (
     "TDAI_TASK_ID",
     "TDAI_USER_KEY",
     "TDAI_MODEL",
+    "TDAI_WIRE_API",
     "TDAI_MEMORY_HARD_CAP_TOKENS",
     "TDAI_MEMORY_RESERVE_TOKENS",
+    "PI_BRANCH_OUT_BACKEND_INSTANCE_ID",
 )
 
 _PI_ENV_KEYS = (
@@ -72,6 +75,13 @@ class PiTdaiBranchAgent(BaseAgent):
         branch_control_extension: str = "",
         require_budget_observation: bool | str = True,
         checkpoint_boundary: str = "harbor-step",
+        policy_file: str = "",
+        policy_version: str = "",
+        max_checkpoints: int | str = 2,
+        min_checkpoint_gap: int | str = 10,
+        sample_probability: float | str = 0.1,
+        max_candidate_probes: int | str = 8,
+        sampling_batch: str = "default-v1",
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
@@ -87,6 +97,18 @@ class PiTdaiBranchAgent(BaseAgent):
         if checkpoint_boundary not in {"harbor-step", "model-call"}:
             raise ValueError("checkpoint_boundary must be 'harbor-step' or 'model-call'")
         self.checkpoint_boundary = checkpoint_boundary
+        self.policy_file = Path(policy_file).expanduser().resolve() if policy_file else None
+        self.policy_version = policy_version.strip()
+        self.max_checkpoints = int(max_checkpoints)
+        self.min_checkpoint_gap = int(min_checkpoint_gap)
+        self.sample_probability = float(sample_probability)
+        self.max_candidate_probes = int(max_candidate_probes)
+        self.sampling_batch = sampling_batch.strip() or "default-v1"
+        if self.max_checkpoints < 0 or self.min_checkpoint_gap < 0 or self.max_candidate_probes < 0:
+            raise ValueError("sampling counts and gap must be non-negative")
+        if not 0 <= self.sample_probability <= 1:
+            raise ValueError("sample_probability must be within [0, 1]")
+        self._remote_policy_file = ""
         if self.branch_checkpoint is not None:
             manifest = CheckpointManifest.load(self.branch_checkpoint / "checkpoint.json")
             if manifest.checkpoint_boundary == "model-call":
@@ -286,14 +308,44 @@ class PiTdaiBranchAgent(BaseAgent):
         if self.checkpoint_boundary == "model-call":
             repo_root = Path(__file__).resolve().parents[2]
             local_collector = repo_root / "extensions" / "tdai-model-call-collector.ts"
-            remote_collector = remote_user_ext_dir / "98-tdai-model-call-collector.ts"
+            remote_collector_root = self.environment_logs_dir / "pi-collector-plugin"
+            await environment.exec(
+                f"mkdir -p {shlex.quote(str(remote_collector_root / 'extensions'))} {shlex.quote(str(remote_collector_root / 'tdai'))}"
+            )
+            remote_collector = remote_collector_root / "extensions" / "tdai-model-call-collector.ts"
             await environment.upload_file(local_collector, str(remote_collector))
+            await environment.upload_file(
+                repo_root / "extensions" / "tdai-budget-override.ts",
+                str(remote_collector_root / "extensions" / "tdai-budget-override.ts"),
+            )
+            for name in ("memory-budget-controller.ts", "progressive-memory-allocator.ts"):
+                await environment.upload_file(repo_root / "tdai" / name, str(remote_collector_root / "tdai" / name))
             self.pi_extensions.append(str(remote_collector))
             local_runner = repo_root / "scripts" / "pi-continue.mjs"
             remote_runner = remote_user_ext_dir / "pi-continue.mjs"
             await environment.upload_file(local_runner, str(remote_runner))
             self._remote_continue_runner = str(remote_runner)
             await environment.exec(f"mkdir -p {shlex.quote(str(self._remote_model_call_dir))}")
+
+        if self.policy_file is not None:
+            if not self.policy_file.is_file():
+                raise FileNotFoundError(f"policy file missing: {self.policy_file}")
+            repo_root = Path(__file__).resolve().parents[2]
+            remote_policy_root = self.environment_logs_dir / "pi-policy-plugin"
+            await environment.exec(
+                f"mkdir -p {shlex.quote(str(remote_policy_root / 'extensions'))} {shlex.quote(str(remote_policy_root / 'tdai'))}"
+            )
+            for extension_name in ("tdai-budget-policy.ts", "tdai-budget-override.ts"):
+                await environment.upload_file(
+                    repo_root / "extensions" / extension_name,
+                    str(remote_policy_root / "extensions" / extension_name),
+                )
+            for name in ("memory-budget-controller.ts", "progressive-memory-allocator.ts"):
+                await environment.upload_file(repo_root / "tdai" / name, str(remote_policy_root / "tdai" / name))
+            remote_policy = remote_policy_root / "policy.json"
+            await environment.upload_file(self.policy_file, str(remote_policy))
+            self._remote_policy_file = str(remote_policy)
+            self.pi_extensions.insert(0, str(remote_policy_root / "extensions" / "tdai-budget-policy.ts"))
 
         if not self.branch_control_extension:
             return
@@ -391,6 +443,9 @@ class PiTdaiBranchAgent(BaseAgent):
 
         extensions = list(self.pi_extensions)
         exec_env = self._runtime_env()
+        if self._remote_policy_file:
+            exec_env["PI_BRANCH_OUT_POLICY_FILE"] = self._remote_policy_file
+            exec_env["PI_BRANCH_OUT_POLICY_VERSION"] = self.policy_version or "unversioned-policy"
         if self.checkpoint_boundary == "model-call":
             call_offset = 0
             if self.branch_checkpoint is not None:
@@ -401,6 +456,11 @@ class PiTdaiBranchAgent(BaseAgent):
                     "PI_BRANCH_OUT_MODEL_CALL_DIR": str(self._remote_model_call_dir),
                     "PI_BRANCH_OUT_CALL_OFFSET": str(call_offset),
                     "PI_BRANCH_OUT_TASK_NAME": environment.environment_name,
+                    "PI_BRANCH_OUT_MAX_CHECKPOINTS": str(self.max_checkpoints),
+                    "PI_BRANCH_OUT_MIN_CHECKPOINT_GAP": str(self.min_checkpoint_gap),
+                    "PI_BRANCH_OUT_SAMPLE_PROBABILITY": str(self.sample_probability),
+                    "PI_BRANCH_OUT_MAX_CANDIDATE_PROBES": str(self.max_candidate_probes),
+                    "PI_BRANCH_OUT_SAMPLING_BATCH": self.sampling_batch,
                 }
             )
         if budget_ratio is not None:
@@ -489,6 +549,10 @@ class PiTdaiBranchAgent(BaseAgent):
                 return
             observation = BudgetObservation.parse(raw.stdout or "")
             observation.verify(budget_ratio)
+            if snapshot is not None:
+                expected_snapshot_id = f"sha256:{hashlib.sha256(snapshot.read_bytes()).hexdigest()}"
+                if observation.snapshot_id != expected_snapshot_id:
+                    raise RuntimeError("branch adapter used a different recall snapshot than the checkpoint")
             (self.logs_dir / f"budget-observation-step-{self._step_index}.json").write_text(
                 (raw.stdout or "").rstrip() + "\n", encoding="utf-8"
             )
@@ -531,38 +595,50 @@ class PiTdaiBranchAgent(BaseAgent):
         # Do not use curl -f: it discards the HTTP body on 4xx, which is the
         # only place proxy puts "session not initialized" / auth errors.
         remote_body = f"/tmp/tdai-bridge-{kind.replace('/', '-')}.json"
-        command = " ".join(
-            [
-                "curl", "-sS", "--max-time", "20", "-o", shlex.quote(remote_body),
-                "-w", shlex.quote("%{http_code}"),
-                "-X", "POST", shlex.quote(url),
-                "-H", shlex.quote("Content-Type: application/json"),
-                "-H", shlex.quote(f"x-conversation-id: {conversation_id}"),
-                "-H", shlex.quote(f"x-tdai-service-id: {space}"),
-                "-d", shlex.quote(body),
-            ]
+        bridge_conversation_id = (
+            f"codex:{conversation_id}"
+            if os.environ.get("TDAI_WIRE_API") == "responses" and ":" not in conversation_id
+            else conversation_id
         )
-        result = await environment.exec(command, env=self._runtime_env() or None)
-        status = (result.stdout or "").strip()
-        raw = await environment.exec(f"cat {shlex.quote(remote_body)} 2>/dev/null || true")
-        payload = (raw.stdout or "").strip()
-        if result.return_code != 0 or not status.startswith("2"):
-            detail = payload or (result.stderr or "").strip() or status
-            raise RuntimeError(f"memory bridge {kind} failed: HTTP {status or '?'} {detail[-1000:]}")
-        value = json.loads(payload or "{}")
-        return value if isinstance(value, dict) else {}
+        candidate_keys = [bridge_conversation_id]
+        if bridge_conversation_id != conversation_id:
+            candidate_keys.append(conversation_id)
+        for index, candidate_key in enumerate(candidate_keys):
+            command = " ".join(
+                [
+                    "curl", "-sS", "--max-time", "20", "-o", shlex.quote(remote_body),
+                    "-w", shlex.quote("%{http_code}"),
+                    "-X", "POST", shlex.quote(url),
+                    "-H", shlex.quote("Content-Type: application/json"),
+                    "-H", shlex.quote(f"x-conversation-id: {candidate_key}"),
+                    "-H", shlex.quote(f"x-tdai-service-id: {space}"),
+                    "-d", shlex.quote(body),
+                ]
+            )
+            result = await environment.exec(command, env=self._runtime_env() or None)
+            status = (result.stdout or "").strip()
+            raw = await environment.exec(f"cat {shlex.quote(remote_body)} 2>/dev/null || true")
+            payload = (raw.stdout or "").strip()
+            if result.return_code == 0 and status.startswith("2"):
+                value = json.loads(payload or "{}")
+                return value if isinstance(value, dict) else {}
+            cold_miss = status == "401" and "session not initialized" in payload
+            if not cold_miss or index + 1 == len(candidate_keys):
+                detail = payload or (result.stderr or "").strip() or status
+                raise RuntimeError(f"memory bridge {kind} failed: HTTP {status or '?'} {detail[-1000:]}")
+        raise RuntimeError(f"memory bridge {kind} failed without a response")
 
     async def _capture_recall_snapshot(
         self,
         environment: BaseEnvironment,
         instruction: str,
         checkpoint_root: Path,
-    ) -> tuple[str | None, str]:
+    ) -> tuple[str | None, str, str | None]:
         if self._step_index <= 1:
-            return None, "session-not-initialized"
+            return None, "session-not-initialized", None
         session_id = await self._current_pi_session_id(environment)
         if not session_id:
-            return None, "pi-session-missing"
+            return None, "pi-session-missing", None
         conversation_id = f"pi-{session_id}"
         try:
             l1 = await self._bridge_search(
@@ -581,7 +657,7 @@ class PiTdaiBranchAgent(BaseAgent):
             )
         except Exception as exc:
             (checkpoint_root / "recall-snapshot-error.txt").write_text(str(exc) + "\n", encoding="utf-8")
-            return None, "bridge-error"
+            return None, "bridge-error", None
 
         snapshot = {
             "version": 1,
@@ -594,8 +670,9 @@ class PiTdaiBranchAgent(BaseAgent):
             "baseline": {"mode": "current-pi", "budget_ratio": 0.0},
         }
         path = checkpoint_root / "recall-snapshot.json"
-        path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return path.name, "ready"
+        snapshot_text = json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n"
+        path.write_text(snapshot_text, encoding="utf-8")
+        return path.name, "ready", hashlib.sha256(snapshot_text.encode("utf-8")).hexdigest()
 
     async def _capture_pre_action_checkpoint(
         self,
@@ -632,7 +709,7 @@ class PiTdaiBranchAgent(BaseAgent):
             pi_source = ""
             pi_checkpoint = ""
 
-        snapshot_name, snapshot_status = await self._capture_recall_snapshot(
+        snapshot_name, snapshot_status, snapshot_sha256 = await self._capture_recall_snapshot(
             environment, instruction, checkpoint_root
         )
         CheckpointManifest(
@@ -647,6 +724,11 @@ class PiTdaiBranchAgent(BaseAgent):
             recall_snapshot_status=snapshot_status,
             baseline_budget_ratio=0.0,
             baseline_action=0.0,
+            snapshot_sha256=snapshot_sha256,
+            backend_instance_id=os.environ.get("PI_BRANCH_OUT_BACKEND_INSTANCE_ID"),
+            backend_proxy_sha256=hashlib.sha256(
+                os.environ.get("TDAI_PROXY_URL", "").encode("utf-8")
+            ).hexdigest(),
         ).dump(checkpoint_root / "checkpoint.json")
 
     async def _restore_checkpoint(self, environment: BaseEnvironment, checkpoint_dir: Path) -> None:
@@ -694,3 +776,49 @@ class PiTdaiBranchAgent(BaseAgent):
             f"find {shlex.quote(cwd)} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} + && "
             f"tar -xzf {shlex.quote(remote_workspace)} -C {shlex.quote(cwd)} && rm -f {shlex.quote(remote_workspace)}"
         )
+
+
+class CheckpointScoreAgent(PiTdaiBranchAgent):
+    """Restore a checkpoint and let Harbor run the official verifier.
+
+    No Pi/model request is made. Harbor creates a fresh task environment, so
+    verifier logs and test files never enter the source agent trajectory.
+    """
+
+    @staticmethod
+    def name() -> str:
+        return "pi-branch-checkpoint-score"
+
+    def version(self) -> str:
+        return "0.1.0"
+
+    async def setup(self, environment: BaseEnvironment) -> None:
+        if self.branch_checkpoint is None:
+            raise ValueError("checkpoint_dir is required")
+        await self._restore_checkpoint(environment, self.branch_checkpoint)
+
+    async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+        return None
+
+    async def resume(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+        return None
+
+
+class InitialScoreAgent(BaseAgent):
+    """Make no workspace changes; Harbor verifies the pristine task state."""
+
+    @staticmethod
+    def name() -> str:
+        return "pi-branch-initial-score"
+
+    def version(self) -> str:
+        return "0.1.0"
+
+    async def setup(self, environment: BaseEnvironment) -> None:
+        return None
+
+    async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+        return None
+
+    async def resume(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
+        return None

@@ -13,6 +13,11 @@ class BudgetObservation:
     injected_tokens: int
     candidate_tokens: int = 0
     snapshot_id: str = ""
+    injected_content_sha256: str = ""
+    effective_action_id: str = ""
+    tokenizer_version: str = ""
+    context_tokens_before_injection: int = 0
+    context_tokens_after_injection: int = 0
 
     @classmethod
     def parse(cls, raw: str) -> "BudgetObservation":
@@ -27,6 +32,11 @@ class BudgetObservation:
             injected_tokens=int(value["injected_tokens"]),
             candidate_tokens=int(value.get("candidate_tokens", 0)),
             snapshot_id=str(value.get("snapshot_id", "")),
+            injected_content_sha256=str(value.get("injected_content_sha256", "")),
+            effective_action_id=str(value.get("effective_action_id", "")),
+            tokenizer_version=str(value.get("tokenizer_version", "")),
+            context_tokens_before_injection=int(value.get("context_tokens_before_injection", 0)),
+            context_tokens_after_injection=int(value.get("context_tokens_after_injection", 0)),
         )
 
     def verify(self, expected_ratio: float, *, tolerance: float = 1e-9) -> None:
@@ -43,6 +53,8 @@ class BudgetObservation:
             self.budget_tokens,
             self.injected_tokens,
             self.candidate_tokens,
+            self.context_tokens_before_injection,
+            self.context_tokens_after_injection,
         ) < 0:
             raise ValueError("observation contains negative token counts")
         if self.budget_tokens > self.feasible_budget_tokens:
@@ -51,3 +63,13 @@ class BudgetObservation:
             raise ValueError("injected tokens exceed applied budget")
         if self.candidate_tokens and self.feasible_budget_tokens > self.candidate_tokens:
             raise ValueError("feasible budget exceeds frozen candidate pool")
+        if self.context_tokens_after_injection:
+            delta = self.context_tokens_after_injection - self.context_tokens_before_injection
+            if delta != self.injected_tokens:
+                raise ValueError("context token delta does not equal rendered injection tokens")
+        if self.injected_content_sha256:
+            if len(self.injected_content_sha256) != 64:
+                raise ValueError("invalid injected content SHA-256")
+            expected_action = f"sha256:{self.injected_content_sha256}"
+            if self.effective_action_id and self.effective_action_id != expected_action:
+                raise ValueError("effective action id does not match injected content")
