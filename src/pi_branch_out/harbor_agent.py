@@ -533,13 +533,32 @@ class PiTdaiBranchAgent(BaseAgent):
                 # instead of exiting after --print.
                 + " </dev/null"
             )
-        argv = ["bash", "-lc", inner]
-        result = await environment.exec(" ".join(shlex.quote(arg) for arg in argv), env=exec_env or None)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
-        (self.logs_dir / f"pi-step-{self._step_index}.stdout.jsonl").write_text(result.stdout or "", encoding="utf-8")
-        (self.logs_dir / f"pi-step-{self._step_index}.stderr.txt").write_text(result.stderr or "", encoding="utf-8")
+        local_stdout = self.logs_dir / f"pi-step-{self._step_index}.stdout.jsonl"
+        local_stderr = self.logs_dir / f"pi-step-{self._step_index}.stderr.txt"
+        remote_stdout = f"/tmp/pi-branch-out-step-{self._step_index}.stdout.jsonl"
+        remote_stderr = f"/tmp/pi-branch-out-step-{self._step_index}.stderr.txt"
+        redirected = (
+            f"set +e; ( {inner} ) >{shlex.quote(remote_stdout)} 2>{shlex.quote(remote_stderr)}; "
+            'status=$?; printf "pi-exit=%s\\n" "$status"; exit "$status"'
+        )
+        argv = ["bash", "-lc", redirected]
+        result = await environment.exec(" ".join(shlex.quote(arg) for arg in argv), env=exec_env or None)
+        try:
+            await environment.download_file(remote_stdout, local_stdout)
+            await environment.download_file(remote_stderr, local_stderr)
+        finally:
+            await environment.exec(
+                f"rm -f {shlex.quote(remote_stdout)} {shlex.quote(remote_stderr)}"
+            )
         if result.return_code != 0:
-            raise RuntimeError(f"Pi exited with {result.return_code}: {(result.stderr or '')[-2000:]}")
+            stderr_tail = ""
+            if local_stderr.is_file():
+                with local_stderr.open("rb") as handle:
+                    handle.seek(0, 2)
+                    handle.seek(max(0, handle.tell() - 8192))
+                    stderr_tail = handle.read().decode("utf-8", errors="replace")[-2000:]
+            raise RuntimeError(f"Pi exited with {result.return_code}: {stderr_tail}")
 
         if budget_ratio is not None:
             raw = await environment.exec(f"cat {shlex.quote(str(self._remote_observation_file))}")
