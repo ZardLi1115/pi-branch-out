@@ -91,3 +91,12 @@ def test_observed_usage_counts_failed_and_uncommitted_trials(tmp_path: Path) -> 
 
     assert totals["model_calls"] == 1
     assert totals["token_units"] == 46
+
+
+def test_docker_daemon_preflight_fails_closed(monkeypatch) -> None:
+    monkeypatch.setattr(
+        collector.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"returncode": 1, "stdout": ""})(),
+    )
+    assert collector.docker_daemon_ready() is False

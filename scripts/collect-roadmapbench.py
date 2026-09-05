@@ -257,6 +257,20 @@ def limit_reached(args: argparse.Namespace, totals: dict[str, int], started: flo
     return None
 
 
+def docker_daemon_ready() -> bool:
+    try:
+        result = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", type=Path, required=True)
@@ -375,6 +389,19 @@ def main() -> int:
     for task_name, task_dir, image in pending:
         summaries = rebuild_indexes(args.output_root, completed_file)
         totals = observed_usage(args.output_root)
+        if not docker_daemon_ready():
+            atomic_write_json(
+                args.output_root / "batch-status.json",
+                {
+                    "state": "infrastructure-unavailable",
+                    "reason": "docker-daemon",
+                    "next_task": task_name,
+                    "usage": totals,
+                    "updated_at": utc_now(),
+                },
+            )
+            print(f"[roadmapbench-collector] stopping before {task_name}: Docker daemon unavailable", flush=True)
+            return 3
         if reason := limit_reached(args, totals, started):
             atomic_write_json(
                 args.output_root / "batch-status.json",
