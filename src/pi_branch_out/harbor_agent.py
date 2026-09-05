@@ -741,14 +741,17 @@ class PiTdaiBranchAgent(BaseAgent):
                 raise FileNotFoundError(patch)
             cwd_result = await environment.exec("pwd")
             cwd = (cwd_result.stdout or "/app").strip() or "/app"
-            remote_patch = "/tmp/pi-branch-workspace.patch"
-            await environment.upload_file(patch, remote_patch)
             command = (
                 f"git -C {shlex.quote(cwd)} reset --hard {shlex.quote(manifest.workspace_base_commit)} && "
-                f"git -C {shlex.quote(cwd)} clean -fd && "
-                f"git -C {shlex.quote(cwd)} apply --binary {shlex.quote(remote_patch)} && "
-                f"rm -f {shlex.quote(remote_patch)}"
+                f"git -C {shlex.quote(cwd)} clean -fd"
             )
+            if patch.stat().st_size > 0:
+                remote_patch = "/tmp/pi-branch-workspace.patch"
+                await environment.upload_file(patch, remote_patch)
+                command += (
+                    f" && git -C {shlex.quote(cwd)} apply --binary {shlex.quote(remote_patch)}"
+                    f" && rm -f {shlex.quote(remote_patch)}"
+                )
             result = await environment.exec(command)
             if result.return_code != 0:
                 raise RuntimeError(f"failed to restore git workspace delta: {(result.stderr or result.stdout or '')[-2000:]}")
