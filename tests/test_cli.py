@@ -41,6 +41,20 @@ def test_natural_passes_offline_runtime_and_1200_second_timeout(tmp_path: Path) 
     assert command[command.index("--n-tasks") + 1] == "5"
 
 
+def test_latest_harbor_trial_result_ignores_newer_job_summary(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    trial = jobs / "run" / "task__trial" / "result.json"
+    summary = jobs / "run" / "result.json"
+    trial.parent.mkdir(parents=True)
+    trial.write_text(json.dumps({"trial_name": "task__trial", "verifier_result": {}}), encoding="utf-8")
+    summary.write_text(json.dumps({"n_total_trials": 1, "stats": {}}), encoding="utf-8")
+
+    path, result = cli._latest_harbor_trial_result(jobs)
+
+    assert path == trial
+    assert result["trial_name"] == "task__trial"
+
+
 def test_branch_grid_skips_equivalent_rendered_actions(tmp_path: Path, monkeypatch) -> None:
     checkpoint = tmp_path / "checkpoint"
     checkpoint.mkdir()

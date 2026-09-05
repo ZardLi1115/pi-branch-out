@@ -292,6 +292,17 @@ def run_train_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _latest_harbor_trial_result(jobs_dir: Path) -> tuple[Path, dict]:
+    candidates = sorted(
+        jobs_dir.rglob("result.json"), key=lambda path: path.stat().st_mtime_ns, reverse=True
+    )
+    for path in candidates:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(result.get("trial_name"), str):
+            return path, result
+    raise RuntimeError(f"Harbor did not emit a trial result under {jobs_dir}")
+
+
 def run_score_checkpoint(args: argparse.Namespace) -> int:
     source_task = Path(args.task).resolve()
     checkpoint = Path(args.checkpoint).resolve()
@@ -308,14 +319,13 @@ def run_score_checkpoint(args: argparse.Namespace) -> int:
         "--jobs-dir", str(jobs_dir), "--agent-kwarg", f"checkpoint_dir={checkpoint}",
     ]
     rc = _run(command)
-    results = sorted(jobs_dir.rglob("result.json"), key=lambda path: path.stat().st_mtime_ns)
-    if rc != 0 or not results:
+    if rc != 0:
         return rc or 1
-    result = json.loads(results[-1].read_text(encoding="utf-8"))
+    result_path, result = _latest_harbor_trial_result(jobs_dir)
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     reward = rewards.get("reward")
     if not isinstance(reward, (int, float)):
-        fallback = results[-1].parent / "verifier" / "reward.json"
+        fallback = result_path.parent / "verifier" / "reward.json"
         if fallback.is_file():
             reward = json.loads(fallback.read_text(encoding="utf-8")).get("reward")
     if not isinstance(reward, (int, float)):
@@ -328,7 +338,7 @@ def run_score_checkpoint(args: argparse.Namespace) -> int:
         "isolated_copy": True,
         "checkpoint": str(checkpoint),
         "snapshot_sha256": manifest.snapshot_sha256,
-        "result": str(results[-1]),
+        "result": str(result_path),
         "scored_at": datetime.now(timezone.utc).isoformat(),
     }
     (checkpoint / "checkpoint-score.json").write_text(
@@ -351,14 +361,13 @@ def run_score_initial(args: argparse.Namespace) -> int:
         "--jobs-dir", str(jobs_dir),
     ]
     rc = _run(command)
-    results = sorted(jobs_dir.rglob("result.json"), key=lambda path: path.stat().st_mtime_ns)
-    if rc != 0 or not results:
+    if rc != 0:
         return rc or 1
-    result = json.loads(results[-1].read_text(encoding="utf-8"))
+    result_path, result = _latest_harbor_trial_result(jobs_dir)
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     reward = rewards.get("reward")
     if not isinstance(reward, (int, float)):
-        fallback = results[-1].parent / "verifier" / "reward.json"
+        fallback = result_path.parent / "verifier" / "reward.json"
         if fallback.is_file():
             reward = json.loads(fallback.read_text(encoding="utf-8")).get("reward")
     if not isinstance(reward, (int, float)):
@@ -369,7 +378,7 @@ def run_score_initial(args: argparse.Namespace) -> int:
         "reward": float(reward),
         "official_verifier": True,
         "isolated_copy": True,
-        "result": str(results[-1]),
+        "result": str(result_path),
         "scored_at": datetime.now(timezone.utc).isoformat(),
     }
     score_output = Path(args.score_output).resolve()
