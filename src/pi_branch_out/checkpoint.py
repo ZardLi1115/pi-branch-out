@@ -23,6 +23,12 @@ class CheckpointManifest:
     recall_snapshot_status: str = "missing"
     baseline_budget_ratio: float | None = None
     baseline_action: float | None = None
+    checkpoint_boundary: str = "harbor-step"
+    model_call_index: int | None = None
+    workspace_mode: str = "archive"
+    workspace_base_commit: str | None = None
+    workspace_patch: str | None = None
+    workspace_untracked_archive: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "CheckpointManifest":

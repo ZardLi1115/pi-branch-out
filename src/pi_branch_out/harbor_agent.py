@@ -64,23 +64,35 @@ class PiTdaiBranchAgent(BaseAgent):
         model_name: str | None = None,
         *,
         pi_executable: str = "pi",
+        pi_runtime_archive: str = "",
         pi_thinking: str = "off",
         pi_extensions: str = "",
         checkpoint_dir: str = "",
         budget_ratio: float | str | None = None,
         branch_control_extension: str = "",
         require_budget_observation: bool | str = True,
+        checkpoint_boundary: str = "harbor-step",
         **kwargs: Any,
     ) -> None:
         super().__init__(logs_dir=logs_dir, model_name=model_name, **kwargs)
         self.pi_executable = pi_executable
+        self.pi_runtime_archive = Path(pi_runtime_archive).expanduser().resolve() if pi_runtime_archive else None
+        self._remote_pi_runtime_root = ""
         self.pi_thinking = pi_thinking
         self.pi_extensions = [p for p in pi_extensions.split(",") if p]
         self.branch_checkpoint = Path(checkpoint_dir).resolve() if checkpoint_dir else None
         self.branch_budget_ratio = float(budget_ratio) if budget_ratio not in (None, "") else None
         self.branch_control_extension = branch_control_extension.strip()
         self.require_budget_observation = str(require_budget_observation).lower() not in {"0", "false", "no", "off"}
+        if checkpoint_boundary not in {"harbor-step", "model-call"}:
+            raise ValueError("checkpoint_boundary must be 'harbor-step' or 'model-call'")
+        self.checkpoint_boundary = checkpoint_boundary
+        if self.branch_checkpoint is not None:
+            manifest = CheckpointManifest.load(self.branch_checkpoint / "checkpoint.json")
+            if manifest.checkpoint_boundary == "model-call":
+                self.checkpoint_boundary = "model-call"
         self._remote_branch_control_extension = ""
+        self._remote_continue_runner = ""
         self._step_index = 0
         self._branch_restored = False
 
@@ -99,6 +111,10 @@ class PiTdaiBranchAgent(BaseAgent):
     @property
     def _remote_observation_file(self) -> PurePosixPath:
         return self.environment_logs_dir / "budget-observation.json"
+
+    @property
+    def _remote_model_call_dir(self) -> PurePosixPath:
+        return self.environment_logs_dir / "model-call-checkpoints"
 
     def _tdai_env(self) -> dict[str, str]:
         env = {key: value for key in _TDAI_ENV_KEYS if (value := os.environ.get(key))}
@@ -135,6 +151,33 @@ class PiTdaiBranchAgent(BaseAgent):
         return {**self._pi_env(), **self._tdai_env()}
 
     async def _ensure_pi(self, environment: BaseEnvironment) -> None:
+        if self.pi_runtime_archive is not None:
+            if not self.pi_runtime_archive.is_file():
+                raise FileNotFoundError(f"Pi runtime archive missing: {self.pi_runtime_archive}")
+            remote_archive = self.environment_logs_dir / "pi-runtime.tar.gz"
+            remote_root = PurePosixPath("/tmp/pi-branch-out-pi-runtime")
+            remote_cli = remote_root / "lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"
+            await environment.upload_file(self.pi_runtime_archive, str(remote_archive))
+            install = await environment.exec(
+                "bash -lc "
+                + shlex.quote(
+                    f"set -euo pipefail; rm -rf {remote_root}; mkdir -p {remote_root}; "
+                    f"tar -xzf {shlex.quote(str(remote_archive))} -C {remote_root} --strip-components=1; "
+                    f"rm -f {shlex.quote(str(remote_archive))}; "
+                    f"test -x {remote_root}/bin/node; test -f {remote_cli}; "
+                    f"sed -i '1c #!{remote_root}/bin/node' {remote_cli}; chmod +x {remote_cli}; "
+                    f"{remote_cli} --version"
+                )
+            )
+            if install.return_code != 0:
+                raise RuntimeError(
+                    "failed to unpack offline Pi runtime: "
+                    + ((install.stderr or install.stdout or "")[-2000:])
+                )
+            self._remote_pi_runtime_root = str(remote_root)
+            self.pi_executable = str(remote_cli)
+            return
+
         check = await environment.exec(
             'bash -lc \'export NVM_DIR="$HOME/.nvm"; '
             '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
@@ -240,6 +283,18 @@ class PiTdaiBranchAgent(BaseAgent):
             if remote_conversation_id_s not in self.pi_extensions:
                 self.pi_extensions.append(remote_conversation_id_s)
 
+        if self.checkpoint_boundary == "model-call":
+            repo_root = Path(__file__).resolve().parents[2]
+            local_collector = repo_root / "extensions" / "tdai-model-call-collector.ts"
+            remote_collector = remote_user_ext_dir / "98-tdai-model-call-collector.ts"
+            await environment.upload_file(local_collector, str(remote_collector))
+            self.pi_extensions.append(str(remote_collector))
+            local_runner = repo_root / "scripts" / "pi-continue.mjs"
+            remote_runner = remote_user_ext_dir / "pi-continue.mjs"
+            await environment.upload_file(local_runner, str(remote_runner))
+            self._remote_continue_runner = str(remote_runner)
+            await environment.exec(f"mkdir -p {shlex.quote(str(self._remote_model_call_dir))}")
+
         if not self.branch_control_extension:
             return
         local_extension = Path(self.branch_control_extension).resolve()
@@ -263,8 +318,12 @@ class PiTdaiBranchAgent(BaseAgent):
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         self._step_index += 1
         if self.branch_checkpoint is None:
-            await self._capture_pre_action_checkpoint(environment, instruction, step_name=f"step-{self._step_index}")
-            await self._run_pi(instruction, environment, resume=False, fork_session=None, budget_ratio=None, snapshot=None)
+            if self.checkpoint_boundary == "harbor-step":
+                await self._capture_pre_action_checkpoint(environment, instruction, step_name=f"step-{self._step_index}")
+            await self._run_pi(
+                instruction, environment, resume=False, fork_session=None,
+                budget_ratio=None, snapshot=None, continue_from_checkpoint=False,
+            )
             return
 
         if not self._branch_restored:
@@ -288,13 +347,17 @@ class PiTdaiBranchAgent(BaseAgent):
             fork_session=checkpoint_session,
             budget_ratio=self.branch_budget_ratio,
             snapshot=snapshot,
+            continue_from_checkpoint=manifest.checkpoint_boundary == "model-call",
         )
 
     async def resume(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         self._step_index += 1
-        if self.branch_checkpoint is None:
+        if self.branch_checkpoint is None and self.checkpoint_boundary == "harbor-step":
             await self._capture_pre_action_checkpoint(environment, instruction, step_name=f"step-{self._step_index}")
-        await self._run_pi(instruction, environment, resume=True, fork_session=None, budget_ratio=None, snapshot=None)
+        await self._run_pi(
+            instruction, environment, resume=True, fork_session=None,
+            budget_ratio=None, snapshot=None, continue_from_checkpoint=False,
+        )
 
     async def _run_pi(
         self,
@@ -305,6 +368,7 @@ class PiTdaiBranchAgent(BaseAgent):
         fork_session: Path | None,
         budget_ratio: float | None,
         snapshot: Path | None,
+        continue_from_checkpoint: bool,
     ) -> None:
         pi_args = [
             self.pi_executable,
@@ -327,6 +391,18 @@ class PiTdaiBranchAgent(BaseAgent):
 
         extensions = list(self.pi_extensions)
         exec_env = self._runtime_env()
+        if self.checkpoint_boundary == "model-call":
+            call_offset = 0
+            if self.branch_checkpoint is not None:
+                manifest = CheckpointManifest.load(self.branch_checkpoint / "checkpoint.json")
+                call_offset = max(0, (manifest.model_call_index or 1) - 1)
+            exec_env.update(
+                {
+                    "PI_BRANCH_OUT_MODEL_CALL_DIR": str(self._remote_model_call_dir),
+                    "PI_BRANCH_OUT_CALL_OFFSET": str(call_offset),
+                    "PI_BRANCH_OUT_TASK_NAME": environment.environment_name,
+                }
+            )
         if budget_ratio is not None:
             if snapshot is None or not snapshot.is_file():
                 raise FileNotFoundError(f"frozen recall snapshot missing: {snapshot}")
@@ -353,15 +429,50 @@ class PiTdaiBranchAgent(BaseAgent):
 
         for extension in extensions:
             pi_args.extend(["--extension", extension])
-        pi_args.append(instruction)
-        inner = (
-            'export NVM_DIR="$HOME/.nvm"; '
-            '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
-            + " ".join(shlex.quote(arg) for arg in pi_args)
-            # Non-interactive: with an open stdin Pi can block waiting on input
-            # instead of exiting after --print.
-            + " </dev/null"
-        )
+        if continue_from_checkpoint:
+            if fork_session is None:
+                raise RuntimeError("model-call continuation requires a checkpoint session")
+            if not self._remote_continue_runner:
+                raise RuntimeError("Pi continuation runner is not available")
+            exec_env.update(
+                {
+                    "PI_BRANCH_OUT_SESSION": str(remote_fork),
+                    "PI_BRANCH_OUT_LEAF_ID": manifest.pi_leaf_id,
+                    "PI_BRANCH_OUT_MODEL": self.model_name or "",
+                    "PI_BRANCH_OUT_THINKING": self.pi_thinking,
+                    "PI_BRANCH_OUT_EXTENSIONS": json.dumps(extensions),
+                }
+            )
+            if self._remote_pi_runtime_root:
+                inner = (
+                    f"export PATH={shlex.quote(self._remote_pi_runtime_root + '/bin')}:$PATH; "
+                    f"export PI_CODING_AGENT_ROOT={shlex.quote(self._remote_pi_runtime_root + '/lib/node_modules/@mariozechner/pi-coding-agent')}; "
+                    f"{shlex.quote(self._remote_pi_runtime_root + '/bin/node')} "
+                    f"{shlex.quote(self._remote_continue_runner)} </dev/null"
+                )
+            else:
+                inner = (
+                    'export NVM_DIR="$HOME/.nvm"; '
+                    '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
+                    'export PI_CODING_AGENT_ROOT="$(npm root -g)/@mariozechner/pi-coding-agent"; '
+                    f"node {shlex.quote(self._remote_continue_runner)} </dev/null"
+                )
+        else:
+            pi_args.append(instruction)
+            inner = (
+                (
+                    f"export PATH={shlex.quote(self._remote_pi_runtime_root + '/bin')}:$PATH; "
+                    if self._remote_pi_runtime_root
+                    else ""
+                )
+                +
+                'export NVM_DIR="$HOME/.nvm"; '
+                '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; '
+                + " ".join(shlex.quote(arg) for arg in pi_args)
+                # Non-interactive: with an open stdin Pi can block waiting on input
+                # instead of exiting after --print.
+                + " </dev/null"
+            )
         argv = ["bash", "-lc", inner]
         result = await environment.exec(" ".join(shlex.quote(arg) for arg in argv), env=exec_env or None)
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -540,6 +651,38 @@ class PiTdaiBranchAgent(BaseAgent):
 
     async def _restore_checkpoint(self, environment: BaseEnvironment, checkpoint_dir: Path) -> None:
         manifest = CheckpointManifest.load(checkpoint_dir / "checkpoint.json")
+        if manifest.workspace_mode == "git-delta-v1":
+            if not manifest.workspace_base_commit or not manifest.workspace_patch:
+                raise ValueError("git-delta-v1 checkpoint is missing base commit or patch")
+            patch = checkpoint_dir / manifest.workspace_patch
+            if not patch.is_file():
+                raise FileNotFoundError(patch)
+            cwd_result = await environment.exec("pwd")
+            cwd = (cwd_result.stdout or "/app").strip() or "/app"
+            remote_patch = "/tmp/pi-branch-workspace.patch"
+            await environment.upload_file(patch, remote_patch)
+            command = (
+                f"git -C {shlex.quote(cwd)} reset --hard {shlex.quote(manifest.workspace_base_commit)} && "
+                f"git -C {shlex.quote(cwd)} clean -fd && "
+                f"git -C {shlex.quote(cwd)} apply --binary {shlex.quote(remote_patch)} && "
+                f"rm -f {shlex.quote(remote_patch)}"
+            )
+            result = await environment.exec(command)
+            if result.return_code != 0:
+                raise RuntimeError(f"failed to restore git workspace delta: {(result.stderr or result.stdout or '')[-2000:]}")
+            if manifest.workspace_untracked_archive:
+                untracked = checkpoint_dir / manifest.workspace_untracked_archive
+                if not untracked.is_file():
+                    raise FileNotFoundError(untracked)
+                remote_untracked = "/tmp/pi-branch-untracked.tar.gz"
+                await environment.upload_file(untracked, remote_untracked)
+                result = await environment.exec(
+                    f"tar -xzf {shlex.quote(remote_untracked)} -C {shlex.quote(cwd)} && "
+                    f"rm -f {shlex.quote(remote_untracked)}"
+                )
+                if result.return_code != 0:
+                    raise RuntimeError(f"failed to restore untracked files: {(result.stderr or result.stdout or '')[-2000:]}")
+            return
         workspace_archive = checkpoint_dir / manifest.workspace_archive
         if not workspace_archive.is_file():
             raise FileNotFoundError(workspace_archive)

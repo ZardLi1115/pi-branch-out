@@ -19,8 +19,10 @@ DEFAULT_ACTIONS = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
 def _agent_kwargs(args: argparse.Namespace, *, checkpoint: Path | None = None, action: BranchAction | None = None) -> list[str]:
     pairs: list[tuple[str, str]] = [
         ("pi_executable", args.pi_executable),
+        ("pi_runtime_archive", args.pi_runtime_archive),
         ("pi_thinking", args.pi_thinking),
         ("pi_extensions", ",".join(args.pi_extension or [])),
+        ("checkpoint_boundary", args.checkpoint_boundary),
     ]
     if args.branch_control_extension:
         pairs.append(("branch_control_extension", str(Path(args.branch_control_extension).resolve())))
@@ -52,10 +54,15 @@ def _harbor_command(
             "--model", args.model,
             "--n-attempts", "1",
             "--n-concurrent", "1",
+            "--environment-build-timeout-multiplier", str(args.environment_build_timeout_multiplier),
             "--resume-trajectory",
             "--jobs-dir", str(jobs_dir.resolve()),
         ]
     )
+    for task_name in args.include_task_name:
+        command.extend(["--include-task-name", task_name])
+    if args.n_tasks is not None:
+        command.extend(["--n-tasks", str(args.n_tasks)])
     command.extend(_agent_kwargs(args, checkpoint=checkpoint, action=action))
     return command
 
@@ -77,8 +84,7 @@ def _run_one_branch(args: argparse.Namespace, checkpoint: Path, ratio: float, ou
     manifest = CheckpointManifest.load(checkpoint / "checkpoint.json")
     if manifest.recall_snapshot_status != "ready" or not manifest.recall_snapshot:
         raise ValueError(
-            f"checkpoint step {manifest.step_index} has no frozen recall snapshot; "
-            "step 1 is baseline-only and cannot be used for strict branch-out"
+            f"checkpoint {manifest.step_name} has no frozen recall snapshot and cannot be used for strict branch-out"
         )
     action = BranchAction(ratio)
     run_root = output_root / run_id
@@ -144,7 +150,36 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--harbor-bin", default="harbor")
     parser.add_argument("--pi-executable", default="pi")
+    parser.add_argument(
+        "--pi-runtime-archive",
+        default="",
+        help="Host path to a prebuilt Linux Pi runtime archive. When set, upload it instead of installing Pi with NVM/npm.",
+    )
     parser.add_argument("--pi-thinking", default="off")
+    parser.add_argument(
+        "--environment-build-timeout-multiplier",
+        type=float,
+        default=2.0,
+        help="Harbor environment build timeout multiplier. The RoadmapBench default 600 seconds becomes 1200 seconds.",
+    )
+    parser.add_argument(
+        "--include-task-name",
+        action="append",
+        default=[],
+        help="Harbor dataset task-name filter; repeatable and supports glob patterns.",
+    )
+    parser.add_argument(
+        "--n-tasks",
+        type=int,
+        default=None,
+        help="Maximum number of dataset tasks after filtering.",
+    )
+    parser.add_argument(
+        "--checkpoint-boundary",
+        choices=("harbor-step", "model-call"),
+        default="harbor-step",
+        help="Freeze state before each Harbor step or each internal Pi model call.",
+    )
     parser.add_argument(
         "--pi-extension", action="append", default=[],
         help="Pi extension path visible inside Harbor; repeatable. Add the official TDAI Pi plugin here.",

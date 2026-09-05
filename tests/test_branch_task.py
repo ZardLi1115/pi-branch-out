@@ -50,3 +50,35 @@ def test_branch_task_keeps_current_and_later_steps(tmp_path: Path) -> None:
     doc = tomlkit.parse((output / "task.toml").read_text(encoding="utf-8"))
     assert [step["name"] for step in doc["steps"]] == ["round-2", "round-3"]
     assert doc["metadata"]["branch_out_source_step"] == 2
+
+
+def test_model_call_checkpoint_keeps_single_step_task_unchanged(tmp_path: Path) -> None:
+    task = tmp_path / "roadmap-task"
+    task.mkdir()
+    (task / "instruction.md").write_text("Implement the roadmap.\n", encoding="utf-8")
+    (task / "task.toml").write_text(
+        '[metadata]\nname = "roadmap-task"\ndescription = "test"\n',
+        encoding="utf-8",
+    )
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    CheckpointManifest(
+        task_name="roadmap-task",
+        step_index=1,
+        step_name="model-call-2",
+        workspace_archive="",
+        pi_checkpoint_session="checkpoint-session.jsonl",
+        pi_source_session="session.jsonl",
+        pi_leaf_id="leaf",
+        checkpoint_boundary="model-call",
+        model_call_index=2,
+        workspace_mode="git-delta-v1",
+        workspace_base_commit="abc123",
+        workspace_patch="workspace.patch",
+    ).dump(checkpoint / "checkpoint.json")
+
+    output = build_branch_task(task, checkpoint, tmp_path / "branch-task")
+
+    doc = tomlkit.parse((output / "task.toml").read_text(encoding="utf-8"))
+    assert "steps" not in doc
+    assert doc["metadata"]["branch_out_checkpoint"] == str(checkpoint.resolve())

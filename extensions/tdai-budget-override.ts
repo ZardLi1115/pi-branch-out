@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { decideMemoryBudget } from "../tdai/memory-budget-controller.js";
 import { allocateProgressiveMemory, renderProgressiveMemory, type L1Candidate } from "../tdai/progressive-memory-allocator.js";
@@ -152,6 +153,7 @@ export default function tdaiBudgetOverride(pi: ExtensionAPI): void {
       feasible_budget_tokens: decision.feasibleBudgetTokens,
       budget_tokens: decision.budgetTokens,
       injected_tokens: injectedTokens,
+      injected_content_sha256: createHash("sha256").update(block).digest("hex"),
       l1_ids: allocation.selected.map((item) => item.id),
       l0_ids: allocation.selected.flatMap((item) => item.selectedL0.map((chunk) => chunk.id)),
       snapshot_id: `${snapshot.version}:${snapshot.query}`,

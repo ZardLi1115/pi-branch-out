@@ -37,23 +37,24 @@ def build_branch_task(source_task: Path, checkpoint_dir: Path, output_dir: Path)
     task_toml = output_dir / "task.toml"
     doc = tomlkit.parse(task_toml.read_text(encoding="utf-8"))
     raw_steps = doc.get("steps")
-    if raw_steps is None:
-        raise ValueError(f"task has no [[steps]] array: {task_toml}")
-    steps = list(raw_steps)
-    if not steps:
-        raise ValueError(f"task has an empty [[steps]] array: {task_toml}")
+    if raw_steps is not None:
+        steps = list(raw_steps)
+        if not steps:
+            raise ValueError(f"task has an empty [[steps]] array: {task_toml}")
 
-    # step_index is 1-based and points to the user request that has not yet run.
-    start = manifest.step_index - 1
-    if start < 0 or start >= len(steps):
-        raise ValueError(
-            f"checkpoint step_index={manifest.step_index} outside task step range 1..{len(steps)}"
-        )
-    kept = steps[start:]
-    new_steps = tomlkit.aot()
-    for step in kept:
-        new_steps.append(step)
-    doc["steps"] = new_steps
+        # step_index is 1-based and points to the user request that has not yet run.
+        start = manifest.step_index - 1
+        if start < 0 or start >= len(steps):
+            raise ValueError(
+                f"checkpoint step_index={manifest.step_index} outside task step range 1..{len(steps)}"
+            )
+        kept = steps[start:]
+        new_steps = tomlkit.aot()
+        for step in kept:
+            new_steps.append(step)
+        doc["steps"] = new_steps
+    elif manifest.checkpoint_boundary != "model-call":
+        raise ValueError(f"task has no [[steps]] array: {task_toml}")
 
     metadata = doc.get("metadata")
     if metadata is not None:

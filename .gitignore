@@ -8,3 +8,5 @@ build/
 branch_runs/
 natural_runs/
 *.log
+runtime/*.tar.gz
+runtime/export/

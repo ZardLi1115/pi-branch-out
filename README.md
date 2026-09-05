@@ -56,7 +56,9 @@ python -m pip install -e .
 需要本机已经能运行：
 
 - Harbor **0.22+**（本仓库 agent 使用 `SUPPORTS_RESUME = True`。旧 Harbor 的 `harbor.agents.capabilities.AgentCapabilities` 已不存在。）
-- Pi coding agent **0.73.1**（Harbor 容器里会按这个版本安装）
+- Pi coding agent **0.73.1**。批量任务建议先运行
+  `scripts/build-pi-runtime.sh` 生成 Linux 离线 runtime，再用
+  `--pi-runtime-archive` 注入，避免每个容器通过 NVM/npm 重装。
 - TDAI Proxy / MemoryCore
 - 一个 Harbor 多 step 任务。仓库里有一条可跑的 EvoCodeBench 示例：
   `examples/harbor_tasks/evocodebench-run-cmd`（`chat.utils.run_cmd`）。原始 `data.jsonl` 不是 Harbor task。
@@ -116,6 +118,42 @@ pi-branch-out branch \
   --model tdai/<model> \
   --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
 ```
+
+## RoadmapBench 单步任务
+
+RoadmapBench 的一整份 roadmap 是一个 Harbor step。Natural 采集必须改用 Pi
+内部 model-call 边界：
+
+```bash
+pi-branch-out natural \
+  --task /path/to/RoadmapBench \
+  --jobs-dir ./natural_runs/roadmapbench \
+  --model tdai/gpt-5.6-luna \
+  --pi-thinking medium \
+  --pi-runtime-archive ./runtime/pi-runtime-linux-amd64.tar.gz \
+  --checkpoint-boundary model-call \
+  --pi-extension /path/to/TencentDB-Agent-Memory/MemoryCore/pi-plugin/index.ts
+```
+
+该入口默认向 Harbor 传
+`--environment-build-timeout-multiplier 2.0`；RoadmapBench 的默认 600 秒构建
+上限因此提升为 1200 秒。正式批采前可先用 Harbor 的 `--install-only --agent
+oracle` 跑一遍数据集，将 115 个官方任务镜像拉取/构建进本机缓存。
+
+Harbor 会把数据集根目录展开为全部任务。每个 trial 的
+`agent/model-call-checkpoints/model-call-states.jsonl` 记录所有模型调用；从
+`call-002/` 起保存可恢复的 Pi leaf id、冻结 recall snapshot，以及相对任务初始
+commit 的 workspace binary diff / 未跟踪文件包。所有点共享 Pi 最终的 append-only
+session 文件，避免为每个调用复制一遍不断增长的 transcript。
+
+从这些 checkpoint 启动 `branch` 或 `branch-grid` 时，采集器通过 Pi 官方 SDK 的
+`Agent.continue()` 恢复 tool loop，不会再次添加 roadmap 用户消息。没有
+`[[steps]]` 的原始 RoadmapBench task 会完整 clone，并继续使用它自己的 verifier。
+
+`default_actual_memory_tokens`、`default_mapped_action` 和
+`actual_injected_content_sha256` 特指方向 F 的动态 L1/L0 注入。当前腾讯默认链路不
+自动注入 L1/L0，所以 Natural 分别为 0、0 和空内容 SHA-256；L2/L3 与工具提示仍由
+TDAI 正常工作，但客户端不会把不可观测的服务端静态注入冒充为精确数据。
 
 Branch 会：
 
