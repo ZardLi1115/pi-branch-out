@@ -17,7 +17,7 @@ NUMERIC_KEYS = (
     "default_actual_memory_tokens", "previous_actual_memory_tokens",
     "previous_mapped_action", "previous_budget_tokens",
 )
-FEATURE_VERSION = "visible-state-hash-v3-history"
+FEATURE_VERSION = "visible-state-hash-v4-memory-text"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -57,7 +57,12 @@ def state_features(state: dict[str, Any]) -> list[float]:
             numeric.extend((len(values), sum(values) / len(values), min(values), max(values)))
         else:
             numeric.extend((0.0, 0.0, 0.0, 0.0))
-    text = f"{state.get('query', '')}\n{state.get('recent_tool_result', '')}"
+    visible_memory = "\n".join(str(value) for value in (state.get("l1_contents") or []))
+    scene_paths = "\n".join(str(value) for value in (state.get("scene_paths") or []))
+    text = (
+        f"{state.get('query', '')}\n{state.get('recent_tool_result', '')}\n"
+        f"{visible_memory}\n{state.get('persona_text', '')}\n{scene_paths}"
+    )
     return numeric + _text_features(text)
 
 
@@ -206,6 +211,9 @@ def train_policy(
     action_index = np.asarray([_action_index(float(row["action"]), actions) for row in transitions], dtype="int64")
     rewards = np.asarray([float(row["reward"]) for row in transitions], dtype="float32")
     terminal = np.asarray([bool(row.get("done")) for row in transitions], dtype="float32")
+    sample_weights = np.asarray([float(row.get("sample_weight", 1.0)) for row in transitions], dtype="float32")
+    if not np.all(np.isfinite(sample_weights)) or np.any(sample_weights <= 0):
+        raise ValueError("transition sample_weight must be finite and positive")
     losses: list[float] = []
 
     for epoch in range(cql_epochs):
@@ -216,12 +224,18 @@ def train_policy(
             chosen = q[np.arange(len(indices)), action_index[indices]]
             td = chosen - targets
             probabilities = _softmax(q)
-            grad = cql_alpha * probabilities / len(indices)
-            grad[np.arange(len(indices)), action_index[indices]] -= cql_alpha / len(indices)
-            grad[np.arange(len(indices)), action_index[indices]] += 2 * td / len(indices)
+            batch_weights = sample_weights[indices]
+            weight_sum = batch_weights.sum()
+            normalized_weights = batch_weights / weight_sum
+            grad = cql_alpha * probabilities * normalized_weights[:, None]
+            grad[np.arange(len(indices)), action_index[indices]] -= cql_alpha * normalized_weights
+            grad[np.arange(len(indices)), action_index[indices]] += 2 * td * normalized_weights
             optimizer.update(online.gradients(x[indices], hidden, grad))
             conservative = np.log(np.exp(q - q.max(axis=1, keepdims=True)).sum(axis=1)) + q.max(axis=1) - chosen
-            losses.append(float(np.mean(np.square(td)) + cql_alpha * np.mean(conservative)))
+            losses.append(float(
+                np.sum(normalized_weights * np.square(td))
+                + cql_alpha * np.sum(normalized_weights * conservative)
+            ))
         if (epoch + 1) % 10 == 0:
             target.copy_from(online)
 
@@ -249,6 +263,7 @@ def train_policy(
         "feature_version": FEATURE_VERSION,
         "pretrain_status": pretrain_status,
         "training_transitions": len(transitions),
+        "training_weight_sum": float(sample_weights.sum()),
         "hyperparameters": {
             "hidden_dim": hidden_dim, "seed": seed, "pretrain_epochs": pretrain_epochs,
             "cql_epochs": cql_epochs, "batch_size": batch_size, "learning_rate": learning_rate,

@@ -41,8 +41,10 @@ def test_longmemeval_export_preserves_paired_actions_and_aliases(tmp_path: Path)
     transitions = [json.loads(line) for line in (output / "transitions.jsonl").read_text().splitlines()]
     aliases = [json.loads(line) for line in (output / "equivalent-action-aliases.jsonl").read_text().splitlines()]
     labels = [json.loads(line) for line in (output / "default-labels.jsonl").read_text().splitlines()]
-    assert len(transitions) == 2
-    assert transitions[1]["reward"] == 0.94
+    assert len(transitions) == 3
+    assert transitions[0]["sample_weight"] == 0.5
+    assert transitions[1]["observation_reused"] is True
+    assert transitions[2]["reward"] == 0.94
     assert aliases[0]["alias_action"] == 0.5
     assert labels[0]["default_action"] == 1.0
     assert labels[0]["allocator_content_match"] is True

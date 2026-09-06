@@ -113,11 +113,16 @@ export function policyFeatures(state: Record<string, unknown>, policy: Policy): 
     if (values.length) numeric.push(values.length, values.reduce((a, b) => a + b, 0) / values.length, Math.min(...values), Math.max(...values));
     else numeric.push(0, 0, 0, 0);
   }
-  return numeric.concat(hashedText(`${String(state.query ?? "")}\n${String(state.recent_tool_result ?? "")}`, policy.hash_dim));
+  const l1Contents = Array.isArray(state.l1_contents) ? state.l1_contents.map(String).join("\n") : "";
+  const scenePaths = Array.isArray(state.scene_paths) ? state.scene_paths.map(String).join("\n") : "";
+  const text = [state.query, state.recent_tool_result, l1Contents, state.persona_text, scenePaths]
+    .map((value) => String(value ?? ""))
+    .join("\n");
+  return numeric.concat(hashedText(text, policy.hash_dim));
 }
 
 export function chooseRatio(policy: Policy, state: Record<string, unknown>): { ratio: number; qValues: number[] } {
-  if (policy.feature_version !== "visible-state-hash-v3-history") throw new Error(`unsupported feature version ${policy.feature_version}`);
+  if (policy.feature_version !== "visible-state-hash-v4-memory-text") throw new Error(`unsupported feature version ${policy.feature_version}`);
   const x = policyFeatures(state, policy);
   if (x.length !== policy.w1.length) throw new Error(`policy input mismatch: ${x.length} != ${policy.w1.length}`);
   const hidden = policy.b1.map((bias, column) => Math.max(0, bias + x.reduce((sum, value, row) => sum + value * policy.w1[row][column], 0)));

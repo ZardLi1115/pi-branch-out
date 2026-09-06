@@ -86,34 +86,38 @@ def export_longmemeval_training(
             normalized_cost = max(0.0, billable_tokens) / cost_normalizer_tokens
             quality_reward = float(sample["reward"])
             reward = quality_reward - cost_coefficient * normalized_cost
-            trajectory_id = f"{question_id}:{sample['effective_action_id']}"
-            transitions.append({
-                "trajectory_id": trajectory_id,
-                "state_id": state_id,
-                "next_state_id": None,
-                "task_id": question_id,
-                "split": split,
-                "action": float(sample["action"]),
-                "reward": reward,
-                "quality_reward": quality_reward,
-                "normalized_cost": normalized_cost,
-                "billable_token_proxy": billable_tokens,
-                "usage": usage,
-                "done": True,
-                "truncated": False,
-                "training_eligible": bool(sample.get("training_eligible", True)),
-                "fork_id": question_id,
-                "injected_content_sha256": str(sample["effective_action_id"]).removeprefix("sha256:"),
-                "effective_action_id": sample["effective_action_id"],
-            })
-            for alias in sample.get("action_aliases", []):
-                if float(alias) == float(sample["action"]):
+            action_aliases = [float(value) for value in sample.get("action_aliases", [sample["action"]])]
+            sample_weight = 1.0 / len(action_aliases)
+            for action in action_aliases:
+                transitions.append({
+                    "trajectory_id": f"{question_id}:{sample['effective_action_id']}:{action:g}",
+                    "state_id": state_id,
+                    "next_state_id": None,
+                    "task_id": question_id,
+                    "split": split,
+                    "action": action,
+                    "reward": reward,
+                    "quality_reward": quality_reward,
+                    "normalized_cost": normalized_cost,
+                    "billable_token_proxy": billable_tokens,
+                    "usage": usage,
+                    "done": True,
+                    "truncated": False,
+                    "training_eligible": bool(sample.get("training_eligible", True)),
+                    "fork_id": question_id,
+                    "injected_content_sha256": str(sample["effective_action_id"]).removeprefix("sha256:"),
+                    "effective_action_id": sample["effective_action_id"],
+                    "sample_weight": sample_weight,
+                    "observation_reused": action != float(sample["action"]),
+                })
+            for alias in action_aliases:
+                if alias == float(sample["action"]):
                     continue
                 aliases.append({
                     "state_id": state_id,
                     "task_id": question_id,
                     "kept_action": float(sample["action"]),
-                    "alias_action": float(alias),
+                    "alias_action": alias,
                     "effective_action_id": sample["effective_action_id"],
                 })
 
@@ -145,6 +149,11 @@ def export_longmemeval_training(
         "unique_states": len(states),
         "default_labels": len(labels),
         "transitions": len(transitions),
+        "training_eligible_transitions": sum(bool(row["training_eligible"]) for row in transitions),
+        "effective_observations": sum(not bool(row["observation_reused"]) for row in transitions),
+        "training_weight_sum": sum(
+            float(row["sample_weight"]) for row in transitions if row["training_eligible"]
+        ),
         "equivalent_action_aliases": len(aliases),
     }
     fingerprint_payload = json.dumps(manifest, sort_keys=True, ensure_ascii=False)

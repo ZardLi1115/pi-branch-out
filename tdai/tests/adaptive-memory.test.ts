@@ -107,7 +107,7 @@ test("frozen MLP policy emits one of the fixed budget actions", () => {
   const inputDimension = 14 + 16 + 128;
   const policy = {
     schema_version: 1,
-    feature_version: "visible-state-hash-v3-history",
+    feature_version: "visible-state-hash-v4-memory-text",
     hash_dim: 128,
     actions: [0, 0.5, 1],
     w1: Array.from({ length: inputDimension }, () => [0]),

@@ -116,6 +116,11 @@ python scripts/export-longmemeval-training.py `
 是行为模仿标签，不表示该动作是该题的最优预算。实际 Q 值只从已执行并评分的
 `transitions.jsonl` 学习。
 
+等价 action 会在训练导出中展开为全部 nominal ratio，但共享同一真实 observation，
+并设置 `sample_weight=1/alias_count`。这样 CQL 不会把已证实等价的 ratio 当成未观测
+动作，同时同一 API 结果在 loss 中的总权重仍为 1，不会虚增证据量。特征版本
+`visible-state-hash-v4-memory-text` 会编码 query、top-5 L1 原文、Persona 和场景路径。
+
 beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动重试。若响应结果
 不确定，item 会写 `ingest-uncertain.json` 并隔离失败；必须换新 batch/namespace，
 不能在原 namespace 上猜测重跑。

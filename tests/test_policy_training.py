@@ -40,4 +40,13 @@ def test_cql_trains_only_real_transitions_and_skips_all_zero_pretrain(tmp_path: 
     result = train_policy(dataset, tmp_path / "policy", cql_epochs=2, batch_size=1)
     assert result["pretrain_status"] == "skipped-all-default-zero"
     assert result["training_transitions"] == 1
+    assert result["training_weight_sum"] == 1.0
     assert (tmp_path / "policy" / "policy.json").is_file()
+
+
+def test_visible_candidate_text_changes_policy_features() -> None:
+    from pi_branch_out.policy_training import state_features
+
+    base = {"query": "where did I go?", "l1_contents": ["Cafe A"]}
+    changed = {"query": "where did I go?", "l1_contents": ["Cafe B"]}
+    assert state_features(base) != state_features(changed)
