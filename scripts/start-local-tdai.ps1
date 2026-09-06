@@ -151,6 +151,7 @@ if ($LASTEXITCODE -ne 0) {
 $coreMount = ($coreConfig -replace '\\', '/') + ":/data/config/tdai-gateway.yaml:ro"
 & docker run -d `
     --name $coreContainer `
+    --restart unless-stopped `
     --network $network `
     --network-alias memory-core `
     -p "${CorePort}:8420" `
@@ -306,6 +307,7 @@ Set-Content -LiteralPath $proxyConfig -Value $proxyYaml -Encoding utf8
 $proxyMount = ($proxyConfig -replace '\\', '/') + ":/data/config.yaml:ro"
 & docker run -d `
     --name $proxyContainer `
+    --restart unless-stopped `
     --network $network `
     --network-alias proxy `
     --add-host host.docker.internal:host-gateway `
