@@ -100,6 +100,8 @@ def export_longmemeval_training(
                     "quality_reward": quality_reward,
                     "normalized_cost": normalized_cost,
                     "billable_token_proxy": billable_tokens,
+                    "budget_tokens": int(sample.get("budget_tokens") or 0),
+                    "injected_tokens": int(sample.get("injected_tokens") or 0),
                     "usage": usage,
                     "done": True,
                     "truncated": False,

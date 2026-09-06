@@ -121,6 +121,21 @@ python scripts/export-longmemeval-training.py `
 动作，同时同一 API 结果在 loss 中的总权重仍为 1，不会虚增证据量。特征版本
 `visible-state-hash-v4-memory-text` 会编码 query、top-5 L1 原文、Persona 和场景路径。
 
+小模型训练后必须用同一批次的配对 dev/test action 做离线冻结评估：
+
+```powershell
+pi-branch-out train-policy `
+  --dataset-dir .local-tdai/longmemeval-collection/training/oracle-v1 `
+  --output-dir .local-tdai/longmemeval-collection/policies/oracle-v1-seed7
+
+python scripts/evaluate-longmemeval-policy.py `
+  --dataset-dir .local-tdai/longmemeval-collection/training/oracle-v1 `
+  --policy-dir .local-tdai/longmemeval-collection/policies/oracle-v1-seed7 `
+  --output .local-tdai/longmemeval-collection/policies/oracle-v1-seed7/evaluation.json
+```
+
+50 题阶段的 dev/test 仍太小，结果只用于训练接线验收，不用于替换默认策略。
+
 beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动重试。若响应结果
 不确定，item 会写 `ingest-uncertain.json` 并隔离失败；必须换新 batch/namespace，
 不能在原 namespace 上猜测重跑。
