@@ -253,6 +253,7 @@ export default function tdaiModelCallCollector(pi: ExtensionAPI): void {
   const writeSummary = (): void => {
     writeFileSync(summaryPath, `${JSON.stringify({
       version: 1,
+      tdai_version: process.env.TDAI_VERSION ?? "unknown",
       sampling_batch: samplingBatch,
       max_checkpoints: maxCheckpoints,
       min_checkpoint_gap: minCheckpointGap,
@@ -338,6 +339,7 @@ export default function tdaiModelCallCollector(pi: ExtensionAPI): void {
     const query = queryFromMessages(messages);
     const state: Record<string, unknown> = {
       version: 1,
+      tdai_version: process.env.TDAI_VERSION ?? "unknown",
       task: process.env.PI_BRANCH_OUT_TASK_NAME ?? basename(ctx?.cwd ?? process.cwd()),
       model_call_index: callIndex,
       timestamp: new Date().toISOString(),

@@ -1,7 +1,8 @@
 # TDAI 记忆预算闭环：实现与运行合同
 
-本文件对应 RoadmapBench 采集路径。TDAI 后端使用
-`TencentCloud/TencentDB-Agent-Memory`，本仓库不修改其源码。
+本文件对应 RoadmapBench 采集路径。TDAI 后端固定使用
+`TencentCloud/TencentDB-Agent-Memory` 的 `v2.0.0-beta.1`
+（commit `41444344ce11467a5b5ad6aa032f5e261da1f4d2`），本仓库不修改其源码。
 
 ## 已实现边界
 
@@ -32,19 +33,17 @@ team+agent。因此冻结候选只构成局部注入实验，不能证明完整�
 还要求 URL 与 instance id 同时含 `{run_id}`，保证每个有效内容动作使用不同实例。
 共享模式只能配合 `--allow-shared-backend-long-branch` 做非训练接线检查。
 
-## Responses / Codex 兼容要求
+## Pi / beta.1 兼容要求
 
-当上游使用 Codex custom provider 的 Responses API 时，设置
-`TDAI_WIRE_API=responses`。外围兼容 extension 会执行三项协议对齐，而不修改
-TencentDB-Agent-Memory：
+beta.1 MemoryProxy 没有 Codex Responses 路由。Pi 通过外围 extension 注册
+`openai-completions` provider，并设置 `TDAI_AGENT_SOURCE=codebuddy`、
+`TDAI_WIRE_API=chat-completions`。本机 custom 上游已验证同时接受该协议。
 
-- 模型请求同时携带相同值的 `x-conversation-id` 与 `session-id`，前者供
-  memory-bridge 使用，后者触发 Codex handler 的 sessionInit。
-- bridge 在热进程中先尝试 `codex:<conversation-id>`；只有收到明确的
-  `session not initialized` 才回退裸 ID，供重启后的持久化 BindingRepo 查询。
-- Pi 省略 Responses message item 的可选 `type` 时，在发送前为已有 role 的 item
-  补 `type: message`，否则当前 TDAI Codex recorder 无法识别 user input，L0 会
-  被静默跳过。
+- 模型请求同时携带相同值的 `x-conversation-id` 与 `x-session-id`。
+- Proxy 以 `codebuddy:<conversation-id>` 保存 session；memory-bridge 接收裸
+  conversation ID 并按 beta.1 的 `codebuddy:` fallback 命中。
+- provider 必须在 extension 加载时先注册，随后在 `session_start` /
+  `before_agent_start` 用稳定 Pi session ID 更新 headers。
 
 本地 Proxy 必须在启动阶段启用持久化 ProxyStorage，例如 SQLite：
 
@@ -59,7 +58,8 @@ storage:
 仅设置 fs fallback 目录不够：当前 Proxy 要到首次 injection pipeline 构建时才安装
 fallback BindingRepo，可能错过第一轮 sessionInit 的 binding 写入。
 
-2026-09-05 的 RoadmapBench `glz-3.0.0-roadmap` 验收结果：78 次模型调用，
+以下 2026-09-05 的 RoadmapBench `glz-3.0.0-roadmap` 结果来自迁移前未固定的
+TDAI checkout，仅保留为历史接线记录，不属于 beta.1 数据：78 次模型调用，
 77 个调用级 checkpoint 全部 recall ready；最大候选 86 条/107080 Token；官方
 3/3 phases、reward 1.0；缓存率按 `cache_read/(input+cache_read)` 计算为
 95.16%。运行产物保存在 git 忽略的 `.local-tdai/`，不作为仓库测试 fixture。

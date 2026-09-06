@@ -4,9 +4,9 @@ param(
     [string]$BatchName = "pilot-v1",
     [string]$OutputRoot = "",
     [string]$Dataset = "D:\TDAI\RoadmapBench\harbor_tasks\vanilla",
-    [string]$RuntimeConfig = "D:\TDAI\pi-branch-out\.local-tdai\natural\runtime.json",
+    [string]$RuntimeConfig = "D:\TDAI\pi-branch-out\.local-tdai\beta1\runtime.json",
     [string]$RuntimeArchive = "D:\TDAI\pi-branch-out\runtime\pi-runtime-linux-amd64.tar.gz",
-    [string]$PiExtension = "D:\TDAI\TencentDB-Agent-Memory\MemoryCore\pi-plugin\index.ts"
+    [string]$PiExtension = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,7 +35,7 @@ else {
     $maxTokenUnits = 40000000
 }
 $collector = Join-Path $PSScriptRoot "collect-roadmapbench.py"
-foreach ($path in @($Dataset, $RuntimeConfig, $RuntimeArchive, $PiExtension, $collector)) {
+foreach ($path in @($Dataset, $RuntimeConfig, $RuntimeArchive, $collector)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required path does not exist: $path"
     }
@@ -53,7 +53,7 @@ if (-not $urlMatch.Success -or -not $auth.OPENAI_API_KEY) {
 
 $keys = @(
     "TDAI_PROXY_URL", "TDAI_SPACE_ID", "TDAI_AGENT_SOURCE", "TDAI_WIRE_API",
-    "TDAI_TEAM_ID", "TDAI_AGENT_ID", "TDAI_TASK_ID", "TDAI_USER_KEY", "TDAI_MODEL"
+    "TDAI_TEAM_ID", "TDAI_AGENT_ID", "TDAI_TASK_ID", "TDAI_USER_KEY", "TDAI_MODEL", "TDAI_VERSION"
 )
 $savedEnvironment = @{}
 try {
@@ -83,7 +83,6 @@ try {
         "--dataset", $Dataset,
         "--output-root", $OutputRoot,
         "--runtime-archive", $RuntimeArchive,
-        "--pi-extension", $PiExtension,
         "--model", "tdai/gpt-5.6-luna",
         "--thinking", "medium",
         "--max-tasks", [string]$taskNames.Count,
@@ -99,6 +98,10 @@ try {
         "--max-candidate-probes", "8",
         "--sampling-batch", "roadmapbench-$BatchName"
     )
+    if ($PiExtension) {
+        if (-not (Test-Path -LiteralPath $PiExtension)) { throw "Required path does not exist: $PiExtension" }
+        $collectorArgs += @("--pi-extension", $PiExtension)
+    }
     foreach ($taskName in $taskNames) {
         $collectorArgs += @("--include-task-name", $taskName)
     }

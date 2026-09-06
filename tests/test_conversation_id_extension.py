@@ -20,13 +20,13 @@ def test_conversation_id_extension_rewrites_provider_headers() -> None:
     text = EXTENSION.read_text(encoding="utf-8")
     code = _code_without_comments(text)
     assert 'headers["x-conversation-id"]' in code
-    assert 'headers["session-id"]' in code
+    assert 'headers["x-session-id"]' in code
     assert 'pi.on("session_start"' in code
     assert 'pi.on("before_agent_start"' in code
     assert "pi.registerProvider" in code
-    assert 'wireApi === "responses"' in code
-    assert 'api: wireApi === "responses" ? "openai-responses"' in code
-    assert 'type: "message"' in code
+    assert "registerTdai(pi);" in code
+    assert 'api: "openai-completions"' in code
+    assert 'process.env.TDAI_AGENT_SOURCE ?? "codebuddy"' in code
     assert 'pi.on("before_provider_headers"' not in code
 
 

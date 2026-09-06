@@ -89,8 +89,9 @@ export TDAI_MODEL="<model>"
 Responses API custom provider 还需设置：
 
 ```bash
-export TDAI_AGENT_SOURCE="codex"
-export TDAI_WIRE_API="responses"
+export TDAI_AGENT_SOURCE="codebuddy"
+export TDAI_WIRE_API="chat-completions"
+export TDAI_VERSION="v2.0.0-beta.1"
 ```
 
 本仓库的 conversation-id extension 会同时补齐 Codex sessionInit、memory-bridge
@@ -168,9 +169,10 @@ snapshot，以及相对任务初始 commit 的 workspace binary diff / 未跟踪
 `[[steps]]` 的原始 RoadmapBench task 会完整 clone，并继续使用它自己的 verifier。
 
 `default_actual_memory_tokens`、`default_mapped_action` 和
-`actual_injected_content_sha256` 特指方向 F 的动态 L1/L0 注入。当前腾讯默认链路不
-自动注入 L1/L0，所以 Natural 分别为 0、0 和空内容 SHA-256；L2/L3 与工具提示仍由
-TDAI 正常工作，但客户端不会把不可观测的服务端静态注入冒充为精确数据。
+`actual_injected_content_sha256` 特指外围预算层的动态 L1/L0 注入。固定的
+TDAI `v2.0.0-beta.1` Proxy 默认不把 L0/L1 自动写入 prompt，而是注入只读记忆工具；
+L2/L3 与工具提示仍由 Proxy 正常注入。因此外围动作的 Natural 标签仍为 0，不能把
+服务端 system 注入或后续主动搜索倒贴到该动作上。
 
 Branch 会：
 
@@ -300,9 +302,14 @@ Pi 的 `models.json` 里 `apiKey` 必须是**裸环境变量名** `CUSTOM_API_KE
 - `memory-bridge` 不要用 `curl -f`：4xx 时 body 被丢掉，错误只剩空白。
 - 容器里查 session 文件用 in-container glob；host 侧 `download_dir` 只能用来做 checkpoint，不能用来代替 session id。
 
-### TDAI Proxy 镜像 vs 源码
+### TDAI beta.1 固定版本
 
-当前 `memory-proxy:latest` 的 `extractSpaceIdFromPath` allowlist **不含** `pi`（本地源码有）。`/pi/<space>/...` 会 401 `missing service_id`。采集时设 `TDAI_AGENT_SOURCE=codebuddy`（`claude-code` / `opencode` / `dsh` / `cursor` 也可以）。Proxy 要用 `PROXY_FULL_STACK=1`（auth + sessionInit + tdai）。Auth 要求 `MEMORY_CORE_GATEWAY_API_KEY` 为空。
+运行源码固定为 tag `v2.0.0-beta.1`（commit
+`41444344ce11467a5b5ad6aa032f5e261da1f4d2`）。该版本 Proxy 仅支持
+Chat Completions / Anthropic 路由，并以 `codebuddy` 或 `claude-code` 处理
+sessionInit；Pi 接线使用 `codebuddy`。tag 漏发 Core Dockerfile，Proxy Dockerfile
+还引用了未发布的可选 `cost-guard` 包，因此本仓库在 `runtime/` 提供两个只负责打包的
+外围 Dockerfile，不修改腾讯源码。
 
 ### Docker / Harbor
 

@@ -276,7 +276,7 @@ def main() -> int:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--runtime-archive", type=Path, required=True)
-    parser.add_argument("--pi-extension", type=Path, required=True)
+    parser.add_argument("--pi-extension", type=Path)
     parser.add_argument("--completed-file", type=Path)
     parser.add_argument("--harbor-bin", default="harbor")
     parser.add_argument("--pi-branch-out-bin", default="pi-branch-out")
@@ -345,7 +345,7 @@ def main() -> int:
         raise RuntimeError("missing required environment keys: " + ", ".join(missing_env))
     if not args.runtime_archive.is_file():
         raise FileNotFoundError(args.runtime_archive)
-    if not args.pi_extension.is_file():
+    if args.pi_extension is not None and not args.pi_extension.is_file():
         raise FileNotFoundError(args.pi_extension)
     for executable in (args.harbor_bin, args.pi_branch_out_bin):
         if not Path(executable).is_file() and shutil.which(executable) is None:
@@ -356,6 +356,7 @@ def main() -> int:
         "dataset": str(args.dataset.resolve()),
         "output_root": str(args.output_root.resolve()),
         "model": args.model,
+        "tdai_version": os.environ.get("TDAI_VERSION", "unknown"),
         "thinking": args.thinking,
         "tasks": [task[0] for task in tasks],
         "sampling": {
@@ -378,7 +379,7 @@ def main() -> int:
     batch_path = args.output_root / "batch.json"
     if batch_path.is_file():
         existing = json.loads(batch_path.read_text(encoding="utf-8"))
-        for key in ("dataset", "model", "thinking", "tasks", "sampling", "limits"):
+        for key in ("dataset", "model", "tdai_version", "thinking", "tasks", "sampling", "limits"):
             if existing.get(key) != batch_manifest.get(key):
                 raise RuntimeError(f"batch configuration changed for {key}; use a new output root")
         batch_manifest["created_at"] = existing.get("created_at", batch_manifest["created_at"])
@@ -453,14 +454,18 @@ def main() -> int:
 
             status.update(phase="natural", updated_at=utc_now())
             atomic_write_json(status_path, status)
-            summary = run_validated(
-                [args.pi_branch_out_bin, "natural", "--task", str(task_dir), "--jobs-dir", str(natural_jobs),
+            natural_command = [
+                 args.pi_branch_out_bin, "natural", "--task", str(task_dir), "--jobs-dir", str(natural_jobs),
                  "--model", args.model, "--harbor-bin", args.harbor_bin, "--pi-thinking", args.thinking,
                  "--checkpoint-boundary", "model-call", "--max-checkpoints", str(args.max_checkpoints),
                  "--min-checkpoint-gap", str(args.min_checkpoint_gap), "--sample-probability",
                  str(args.sample_probability), "--max-candidate-probes", str(args.max_candidate_probes),
                  "--sampling-batch", args.sampling_batch, "--pi-runtime-archive", str(args.runtime_archive),
-                 "--pi-extension", str(args.pi_extension)],
+            ]
+            if args.pi_extension is not None:
+                natural_command.extend(["--pi-extension", str(args.pi_extension)])
+            summary = run_validated(
+                natural_command,
                 lambda: validate_natural(natural_jobs, task_name, args.max_checkpoints),
                 max_attempts=1, retry_delay_seconds=args.retry_delay_seconds,
             )

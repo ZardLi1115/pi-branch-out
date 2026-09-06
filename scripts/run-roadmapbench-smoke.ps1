@@ -1,14 +1,14 @@
 [CmdletBinding()]
 param(
     [string]$Task = "D:\TDAI\RoadmapBench\harbor_tasks\vanilla\glz-3.0.0-roadmap",
-    [string]$JobsDir = "D:\TDAI\pi-branch-out\.local-tdai\smoke\glz-3.0.0-roadmap",
-    [string]$RuntimeConfig = "D:\TDAI\pi-branch-out\.local-tdai\natural\runtime.json",
+    [string]$JobsDir = "D:\TDAI\pi-branch-out\.local-tdai\beta1-smoke\glz-3.0.0-roadmap",
+    [string]$RuntimeConfig = "D:\TDAI\pi-branch-out\.local-tdai\beta1\runtime.json",
     [string]$RuntimeArchive = "D:\TDAI\pi-branch-out\runtime\pi-runtime-linux-amd64.tar.gz",
-    [string]$PiExtension = "D:\TDAI\TencentDB-Agent-Memory\MemoryCore\pi-plugin\index.ts"
+    [string]$PiExtension = ""
 )
 
 $ErrorActionPreference = "Stop"
-foreach ($path in @($Task, $RuntimeConfig, $RuntimeArchive, $PiExtension)) {
+foreach ($path in @($Task, $RuntimeConfig, $RuntimeArchive)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Required path does not exist: $path"
     }
@@ -29,7 +29,7 @@ if (-not $urlMatch.Success -or -not $auth.OPENAI_API_KEY) {
 
 $keys = @(
     "TDAI_PROXY_URL", "TDAI_SPACE_ID", "TDAI_AGENT_SOURCE", "TDAI_WIRE_API",
-    "TDAI_TEAM_ID", "TDAI_AGENT_ID", "TDAI_TASK_ID", "TDAI_USER_KEY", "TDAI_MODEL"
+    "TDAI_TEAM_ID", "TDAI_AGENT_ID", "TDAI_TASK_ID", "TDAI_USER_KEY", "TDAI_MODEL", "TDAI_VERSION"
 )
 try {
     foreach ($key in $keys) {
@@ -42,20 +42,26 @@ try {
     $env:PYTHONIOENCODING = "utf-8"
     $env:NO_COLOR = "1"
     $env:TERM = "dumb"
-    & pi-branch-out natural `
-        --task $Task `
-        --jobs-dir $JobsDir `
-        --model "tdai/gpt-5.6-luna" `
-        --harbor-bin harbor `
-        --pi-thinking medium `
-        --checkpoint-boundary model-call `
-        --max-checkpoints 2 `
-        --min-checkpoint-gap 10 `
-        --sample-probability 0.1 `
-        --max-candidate-probes 8 `
-        --sampling-batch sampling-smoke-v1 `
-        --pi-runtime-archive $RuntimeArchive `
-        --pi-extension $PiExtension
+    $arguments = @(
+        "natural",
+        "--task", $Task,
+        "--jobs-dir", $JobsDir,
+        "--model", "tdai/gpt-5.6-luna",
+        "--harbor-bin", "harbor",
+        "--pi-thinking", "medium",
+        "--checkpoint-boundary", "model-call",
+        "--max-checkpoints", "2",
+        "--min-checkpoint-gap", "10",
+        "--sample-probability", "0.1",
+        "--max-candidate-probes", "8",
+        "--sampling-batch", "sampling-smoke-v1",
+        "--pi-runtime-archive", $RuntimeArchive
+    )
+    if ($PiExtension) {
+        if (-not (Test-Path -LiteralPath $PiExtension)) { throw "Required path does not exist: $PiExtension" }
+        $arguments += @("--pi-extension", $PiExtension)
+    }
+    & pi-branch-out @arguments
     exit $LASTEXITCODE
 }
 finally {

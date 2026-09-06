@@ -4,8 +4,8 @@ param(
     [int]$CorePort = 8420,
     [int]$ProxyPort = 8096,
     [string]$Model = "gpt-5.6-luna",
-    [string]$CoreImage = "tdai-memory-core-local:latest",
-    [string]$ProxyImage = "tdai-memory-proxy-local:latest",
+    [string]$CoreImage = "tdai-memory-core-local:v2.0.0-beta.1",
+    [string]$ProxyImage = "tdai-memory-proxy-local:v2.0.0-beta.1",
     [switch]$Recreate
 )
 
@@ -187,10 +187,30 @@ if ($verified.code -ne 0) {
 $userId = [string]$verified.data.user.user_id
 $teams = Invoke-CorePost "/v3/meta/team/list" @{ user_id = $userId; limit = 100 } $adminKey
 $teamId = [string]$teams.data.items[0].team_id
+if (-not $teamId) {
+    $team = Invoke-CorePost "/v3/meta/team/create" @{
+        name = "RoadmapBench-$InstanceName"
+        description = "pi-branch-out TDAI instance"
+        owner_user_id = $userId
+    } $adminKey
+    $teamId = [string]$team.data.team.team_id
+    if (-not $teamId) { $teamId = [string]$team.data.team_id }
+}
 $agents = Invoke-CorePost "/v3/meta/agent/list" @{ team_id = $teamId; limit = 100 } $adminKey
 $agentId = [string]$agents.data.items[0].agent_id
+if (-not $agentId) {
+    $agent = Invoke-CorePost "/v3/meta/agent/create" @{
+        team_id = $teamId
+        name = "Pi-$InstanceName"
+        description = "Pi RoadmapBench agent"
+        owner_user_id = $userId
+        visibility = "team"
+    } $adminKey
+    $agentId = [string]$agent.data.agent.agent_id
+    if (-not $agentId) { $agentId = [string]$agent.data.agent_id }
+}
 if (-not $teamId -or -not $agentId) {
-    throw "Default Team/Agent was not created"
+    throw "Team/Agent initialization did not return identifiers"
 }
 $task = Invoke-CorePost "/v3/meta/task/create" @{
     team_id = $teamId
@@ -217,7 +237,7 @@ upstream:
   url: "$safeUrl"
   apiKey: "$safeKey"
   agents:
-    codex:
+    codebuddy:
       url: "$safeUrl"
       apiKey: "$safeKey"
 log:
@@ -236,6 +256,7 @@ tdai:
     recallL1: true
     injectL2L3: true
     l1Limit: 36
+    l2Limit: 3
     timeoutMs: 5000
 skill:
   endpoint: "http://memory-core:8420"
@@ -296,8 +317,9 @@ $runtime = @{
     instance_name = $InstanceName
     TDAI_PROXY_URL = "http://127.0.0.1:$ProxyPort"
     TDAI_SPACE_ID = "default"
-    TDAI_AGENT_SOURCE = "codex"
-    TDAI_WIRE_API = "responses"
+    TDAI_AGENT_SOURCE = "codebuddy"
+    TDAI_WIRE_API = "chat-completions"
+    TDAI_VERSION = "v2.0.0-beta.1"
     TDAI_TEAM_ID = $teamId
     TDAI_AGENT_ID = $agentId
     TDAI_TASK_ID = $taskId

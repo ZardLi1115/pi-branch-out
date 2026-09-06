@@ -2,30 +2,37 @@
 param(
     [string]$RuntimeConfig = "D:\TDAI\pi-branch-out\.local-tdai\natural\runtime.json",
     [string]$RuntimeArchive = "D:\TDAI\pi-branch-out\runtime\pi-runtime-linux-amd64.tar.gz",
-    [string]$Image = "znpt/roadmapbench-glz-3.0.0-roadmap:latest"
+    [string]$Image = "znpt/roadmapbench-plr-1.18.0-roadmap:latest"
 )
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$tdaiRoot = (Resolve-Path -LiteralPath "D:\TDAI\TencentDB-Agent-Memory").Path
 $runtime = Get-Content -Raw -Encoding utf8 $RuntimeConfig | ConvertFrom-Json
+$proxyUri = [uri][string]$runtime.TDAI_PROXY_URL
+$containerProxyUrl = "http://host.docker.internal:$($proxyUri.Port)"
 $runId = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssZ")
 $output = Join-Path $repoRoot ".local-tdai\wiring-smoke\$runId"
 New-Item -ItemType Directory -Path $output | Out-Null
 $envFile = Join-Path $output "container.env"
 $containerScript = Join-Path $output "run.sh"
 $envLines = @(
-    "TDAI_PROXY_URL=http://host.docker.internal:8096",
+    "TDAI_PROXY_URL=$containerProxyUrl",
     "TDAI_SPACE_ID=$($runtime.TDAI_SPACE_ID)",
-    "TDAI_AGENT_SOURCE=codex",
-    "TDAI_WIRE_API=responses",
+    "TDAI_AGENT_SOURCE=$($runtime.TDAI_AGENT_SOURCE)",
+    "TDAI_WIRE_API=$($runtime.TDAI_WIRE_API)",
+    "TDAI_VERSION=$($runtime.TDAI_VERSION)",
     "TDAI_TEAM_ID=$($runtime.TDAI_TEAM_ID)",
     "TDAI_AGENT_ID=$($runtime.TDAI_AGENT_ID)",
     "TDAI_TASK_ID=$($runtime.TDAI_TASK_ID)",
     "TDAI_USER_KEY=$($runtime.TDAI_USER_KEY)",
     "TDAI_MODEL=gpt-5.6-luna",
     "PI_BRANCH_OUT_MODEL_CALL_DIR=/output",
-    "PI_BRANCH_OUT_TASK_NAME=tdai-wiring-smoke"
+    "PI_BRANCH_OUT_TASK_NAME=tdai-wiring-smoke",
+    "PI_BRANCH_OUT_MAX_CHECKPOINTS=1",
+    "PI_BRANCH_OUT_MIN_CHECKPOINT_GAP=0",
+    "PI_BRANCH_OUT_SAMPLE_PROBABILITY=1",
+    "PI_BRANCH_OUT_MAX_CANDIDATE_PROBES=1",
+    "PI_BRANCH_OUT_SAMPLING_BATCH=beta1-wiring-smoke"
 )
 Set-Content -LiteralPath $envFile -Value $envLines -Encoding utf8
 $scriptText = @'
@@ -35,7 +42,6 @@ tar -xzf /input/pi-runtime.tar.gz -C /tmp/pi-runtime --strip-components=1
 /tmp/pi-runtime/bin/node /tmp/pi-runtime/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js \
   --print --mode json --session-dir /tmp/pi-session --thinking low \
   --model tdai/gpt-5.6-luna \
-  --extension /tdai/MemoryCore/pi-plugin/index.ts \
   --extension /branch/extensions/tdai-conversation-id.ts \
   --extension /branch/extensions/tdai-model-call-collector.ts \
   "Use the bash tool to run pwd, then answer with one short sentence." </dev/null
@@ -55,7 +61,6 @@ try {
         "-v", (New-DockerMountSpec -HostPath $RuntimeArchive -ContainerPath "/input/pi-runtime.tar.gz" -ReadOnly),
         "-v", (New-DockerMountSpec -HostPath $containerScript -ContainerPath "/input/run.sh" -ReadOnly),
         "-v", (New-DockerMountSpec -HostPath $repoRoot -ContainerPath "/branch" -ReadOnly),
-        "-v", (New-DockerMountSpec -HostPath $tdaiRoot -ContainerPath "/tdai" -ReadOnly),
         "-v", (New-DockerMountSpec -HostPath $output -ContainerPath "/output"),
         "--entrypoint", "/bin/sh",
         $Image,
