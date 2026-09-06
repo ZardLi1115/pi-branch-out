@@ -52,6 +52,8 @@ pwsh -File scripts/run-longmemeval.ps1 `
 ```
 
 回答模型和 judge 默认都使用本机 Codex `custom` provider 的 `gpt-5.6-luna`。
+回答模板采用 LongMemEval 官方 retrieved-facts 语义，不额外要求保守拒答；版本会写入
+manifest，避免不同 prompt 的数据混用。
 judge prompt 与 LongMemEval 官方 `evaluate_qa.py` 一致，但这不是官方 GPT-4o judge，
 manifest 会标记为 `official-prompt-custom-judge`。若以后提供官方 judge endpoint，
 需单独运行标准脚本或将 judge 模型改成 `gpt-4o-2024-08-06`。

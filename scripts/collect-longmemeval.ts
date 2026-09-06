@@ -33,8 +33,8 @@ interface Options {
   requireActionDiversity: boolean;
 }
 
-const ANSWER_SYSTEM = `You answer questions about a user's prior conversations.
-Use only the memory context supplied with the current question. If the memory does not contain the answer, say that you do not have enough information. Return a concise final answer.`;
+const ANSWER_SYSTEM = "You answer questions about a user's prior conversations. Return a concise final answer.";
+const ANSWER_PROMPT_VERSION = "longmemeval-retrieved-facts-v1";
 
 function argValue(argv: string[], name: string): string | undefined {
   const index = argv.indexOf(name);
@@ -282,6 +282,7 @@ function normalizedUsage(response: Json): Json {
 function answerMessages(entry: Json, stableContext: string, memory: string): Json[] {
   const system = [ANSWER_SYSTEM, stableContext].filter(Boolean).join("\n\n");
   const user = [
+    "I will give you several facts extracted from history chats between you and a user. Please answer the question based on the relevant facts.",
     memory,
     `Current Date: ${entry.question_date}`,
     `Question: ${entry.question}`,
@@ -493,6 +494,7 @@ async function runItem(
     allocator_version: "openclaw-beta1-complete-render-v1",
     tdai_version: runtime.TDAI_VERSION,
     answer_model: options.answerModel,
+    answer_prompt_version: ANSWER_PROMPT_VERSION,
     query: entry.question,
     recent_tool_result: "",
     default_actual_memory_tokens: planned.plans.at(-1)?.injectedTokens ?? 0,
@@ -542,11 +544,12 @@ async function runItem(
       maxTokens: options.maxAnswerTokens,
     });
     const hypothesis = completionText(answerResponse);
+    const scoringPrompt = judgePrompt(entry, hypothesis);
     const judgeResponse = await chatCompletion({
       baseUrl: modelBaseUrl,
       apiKey: modelApiKey,
       model: options.judgeModel,
-      messages: [{ role: "user", content: judgePrompt(entry, hypothesis) }],
+      messages: [{ role: "user", content: scoringPrompt }],
       maxTokens: 10,
     });
     const judgeText = completionText(judgeResponse);
@@ -565,6 +568,7 @@ async function runItem(
     });
     writeJson(join(actionDir, "judge.json"), {
       model: options.judgeModel,
+      prompt: scoringPrompt,
       response: judgeText,
       reward,
       usage: normalizedUsage(judgeResponse),
@@ -650,6 +654,7 @@ async function main(): Promise<void> {
       tdai_version: runtime.TDAI_VERSION,
       tdai_prompt_mode: runtime.TDAI_PROMPT_MODE,
       answer_model: options.answerModel,
+      answer_prompt_version: ANSWER_PROMPT_VERSION,
       judge_model: options.judgeModel,
       judge_protocol: options.judgeModel === "gpt-4o-2024-08-06" ? "official" : "official-prompt-custom-judge",
       action_ratios: options.ratios,

@@ -31,3 +31,8 @@ python (Join-Path $PSScriptRoot "export-longmemeval-training.py") `
     --collection-root $batch `
     --output-dir (Join-Path $collection "training/$BatchName")
 if ($LASTEXITCODE -ne 0) { throw "LongMemEval training export failed" }
+
+python (Join-Path $PSScriptRoot "summarize-longmemeval.py") `
+    --collection-root $batch `
+    --output (Join-Path $batch "summary.json")
+if ($LASTEXITCODE -ne 0) { throw "LongMemEval summary failed" }
