@@ -125,9 +125,7 @@ $runtimeConfig = Get-Content -Raw -Encoding utf8 $runtime | ConvertFrom-Json
 $coreHealth = "$($runtimeConfig.TDAI_CORE_URL.TrimEnd('/'))/health"
 $proxyHealth = "$($runtimeConfig.TDAI_PROXY_URL.TrimEnd('/'))/health"
 $batch = Join-Path $collection "runs/$BatchName"
-if (-not (Test-Health $coreHealth)) {
-    $null = Move-UnfrozenAttemptsToAudit "preflight-core-down"
-}
+$null = Move-UnfrozenAttemptsToAudit "preflight-unfrozen"
 Ensure-RuntimeHealth
 
 $selection = Join-Path $collection "selections/oracle-stratified-v1.json"
@@ -150,9 +148,7 @@ for ($attempt = 0; $attempt -le $MaxInfrastructureRestarts; $attempt++) {
         break
     }
     if ($attempt -ge $MaxInfrastructureRestarts) { break }
-    if (-not (Test-Health $coreHealth)) {
-        $null = Move-UnfrozenAttemptsToAudit "core-down-attempt-$attempt"
-    }
+    $null = Move-UnfrozenAttemptsToAudit "failed-attempt-$attempt"
     Write-Output "Collection interrupted; recovering infrastructure (attempt $($attempt + 1)/$MaxInfrastructureRestarts)"
     Start-Sleep -Seconds 5
 }

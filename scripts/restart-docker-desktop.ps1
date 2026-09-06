@@ -17,14 +17,14 @@ Start-Process -FilePath $DockerDesktopPath -WindowStyle Hidden
 $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 while ([DateTime]::UtcNow -lt $deadline) {
     $job = Start-Job -ScriptBlock {
-        & docker version --format '{{.Server.Version}}' 2>&1 | Out-String
-        if ($LASTEXITCODE -ne 0) { throw "docker version failed" }
+        $output = & docker version --format '{{.Server.Version}}' 2>&1 | Out-String
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output.Trim() }
     }
     try {
         if (Wait-Job -Job $job -Timeout 10) {
-            $version = (Receive-Job -Job $job -ErrorAction SilentlyContinue | Out-String).Trim()
-            if ($version) {
-                Write-Output "Docker daemon ready: $version"
+            $result = Receive-Job -Job $job -ErrorAction SilentlyContinue
+            if ($result.ExitCode -eq 0 -and $result.Output -match '^\d+\.\d+') {
+                Write-Output "Docker daemon ready: $($result.Output)"
                 exit 0
             }
         }
