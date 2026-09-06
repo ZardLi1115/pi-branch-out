@@ -147,6 +147,14 @@ beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动�
 追加。批量入口会恢复已有但停止的容器并等待健康，运行中快速连接失败会触发熔断，
 避免把后续题目全部标成独立数据失败。
 
+若 Docker Desktop 前端仍在但 daemon pipe 无响应，应通过 wake-run 执行：
+
+```powershell
+pwsh -File scripts/restart-docker-desktop.ps1
+```
+
+批量脚本对每次 `docker info/update/start` 都有独立超时，不会再永久卡在 Docker CLI。
+
 ## 超长 L0 边界
 
 cleaned-S 有 152/500 个实例含至少一条超过 8192 字符的干扰消息（没有 evidence

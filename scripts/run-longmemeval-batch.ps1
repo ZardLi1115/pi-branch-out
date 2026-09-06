@@ -45,11 +45,34 @@ function Wait-Health([string]$Url, [int]$TimeoutSeconds = 120) {
 function Wait-Docker([int]$TimeoutSeconds = 180) {
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
-        & docker info *> $null
-        if ($LASTEXITCODE -eq 0) { return }
+        $result = Invoke-DockerCommand -Arguments @("info") -TimeoutSeconds 10
+        if ($result.Success) { return }
         Start-Sleep -Seconds 3
     }
     throw "Timed out waiting for Docker daemon"
+}
+
+function Invoke-DockerCommand([string[]]$Arguments, [int]$TimeoutSeconds = 30) {
+    $job = Start-Job -ScriptBlock {
+        param([string[]]$DockerArguments)
+        $output = & docker @DockerArguments 2>&1 | Out-String
+        [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output.Trim() }
+    } -ArgumentList (, $Arguments)
+    try {
+        if (-not (Wait-Job -Job $job -Timeout $TimeoutSeconds)) {
+            Stop-Job -Job $job
+            return [pscustomobject]@{ Success = $false; ExitCode = -1; Output = "timed out" }
+        }
+        $value = Receive-Job -Job $job
+        return [pscustomobject]@{
+            Success = $value.ExitCode -eq 0
+            ExitCode = $value.ExitCode
+            Output = $value.Output
+        }
+    }
+    finally {
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Move-UnfrozenAttemptsToAudit([string]$Reason) {
@@ -83,17 +106,17 @@ function Move-UnfrozenAttemptsToAudit([string]$Reason) {
 function Ensure-RuntimeHealth {
     Wait-Docker
     foreach ($container in @([string]$runtimeConfig.core_container, [string]$runtimeConfig.proxy_container)) {
-        & docker update --restart unless-stopped $container *> $null
-        if ($LASTEXITCODE -ne 0) { throw "Failed to set restart policy for $container" }
+        $updated = Invoke-DockerCommand -Arguments @("update", "--restart", "unless-stopped", $container)
+        if (-not $updated.Success) { throw "Failed to set restart policy for ${container}: $($updated.Output)" }
     }
     if (-not (Test-Health $coreHealth)) {
-        & docker start ([string]$runtimeConfig.core_container) | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Failed to restart $($runtimeConfig.core_container)" }
+        $started = Invoke-DockerCommand -Arguments @("start", [string]$runtimeConfig.core_container) -TimeoutSeconds 60
+        if (-not $started.Success) { throw "Failed to restart $($runtimeConfig.core_container): $($started.Output)" }
         Wait-Health $coreHealth
     }
     if (-not (Test-Health $proxyHealth)) {
-        & docker start ([string]$runtimeConfig.proxy_container) | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Failed to restart $($runtimeConfig.proxy_container)" }
+        $started = Invoke-DockerCommand -Arguments @("start", [string]$runtimeConfig.proxy_container) -TimeoutSeconds 60
+        if (-not $started.Success) { throw "Failed to restart $($runtimeConfig.proxy_container): $($started.Output)" }
         Wait-Health $proxyHealth
     }
 }
