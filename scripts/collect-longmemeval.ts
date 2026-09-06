@@ -320,10 +320,20 @@ function parseLongMemDate(value: string, offsetMs: number): string {
   return new Date(Date.UTC(+year, +month - 1, +day, +hour, +minute, 0, offsetMs)).toISOString();
 }
 
-function prepareMessages(entry: Json, options: Options): { sessions: Json[][]; truncations: Json[] } {
-  const sessions: Json[][] = [];
+export function chronologicalSessionIndices(entry: Json): number[] {
+  return entry.haystack_dates
+    .map((date: string, index: number) => ({ index, timestamp: Date.parse(parseLongMemDate(date, 0)) }))
+    .sort((left: Json, right: Json) => left.timestamp - right.timestamp || left.index - right.index)
+    .map((row: Json) => row.index);
+}
+
+function prepareMessages(entry: Json, options: Options): {
+  sessions: Array<{ sourceIndex: number; sourceSessionId: string; messages: Json[] }>;
+  truncations: Json[];
+} {
+  const sessions: Array<{ sourceIndex: number; sourceSessionId: string; messages: Json[] }> = [];
   const truncations: Json[] = [];
-  for (let sessionIndex = 0; sessionIndex < entry.haystack_sessions.length; sessionIndex += 1) {
+  for (const sessionIndex of chronologicalSessionIndices(entry)) {
     const source = entry.haystack_sessions[sessionIndex];
     const date = entry.haystack_dates[sessionIndex];
     const messages: Json[] = [];
@@ -343,7 +353,11 @@ function prepareMessages(entry: Json, options: Options): { sessions: Json[][]; t
       }
       messages.push({ role: message.role, content, timestamp: parseLongMemDate(date, turnIndex) });
     }
-    sessions.push(messages);
+    sessions.push({
+      sourceIndex: sessionIndex,
+      sourceSessionId: String(entry.haystack_session_ids[sessionIndex]),
+      messages,
+    });
   }
   return { sessions, truncations };
 }
@@ -390,9 +404,9 @@ async function runItem(
     _readJsonl(ingestLog).map((row) => `${row.source_session_id}\0${row.batch_start}`),
   );
   let acceptedMessages = 0;
-  for (let sessionIndex = 0; sessionIndex < prepared.sessions.length; sessionIndex += 1) {
-    const messages = prepared.sessions[sessionIndex];
-    const sourceSessionId = String(entry.haystack_session_ids[sessionIndex]);
+  for (const session of prepared.sessions) {
+    const messages = session.messages;
+    const sourceSessionId = session.sourceSessionId;
     const sessionId = `lme-${sha256(`${questionId}\0${sourceSessionId}`).slice(0, 24)}`;
     for (let start = 0; start < messages.length; start += 100) {
       const batch = messages.slice(start, start + 100);
@@ -416,6 +430,7 @@ async function runItem(
       }
       appendJsonl(ingestLog, {
         source_session_id: sourceSessionId,
+        source_session_index: session.sourceIndex,
         memory_session_id: sessionId,
         batch_start: start,
         message_count: batch.length,
@@ -475,6 +490,7 @@ async function runItem(
     source_file: basename(options.data),
     history_session_count: entry.haystack_sessions.length,
     history_message_count: acceptedMessages,
+    history_ingest_order: "haystack_dates-ascending-stable-v1",
     candidate_snapshot_id: snapshotId,
     l1_count: recalled.l1.length,
     l1_lengths: recalled.l1.map((item) => item.content.length),
@@ -660,6 +676,7 @@ async function main(): Promise<void> {
       action_ratios: options.ratios,
       allocator_version: "openclaw-beta1-complete-render-v1",
       openclaw_recall_max_results: 5,
+      history_ingest_order: "haystack_dates-ascending-stable-v1",
       fixed_layers: ["L2", "L3"],
       controlled_layers: ["L1"],
       overlong_policy: options.overlongPolicy,
@@ -671,6 +688,15 @@ async function main(): Promise<void> {
   if (collectionManifest.data_sha256 !== sourceSha256) throw new Error("existing batch uses a different source dataset");
   if (stableJson(collectionManifest.action_ratios) !== stableJson(options.ratios)) {
     throw new Error("existing batch uses a different action table");
+  }
+  if (collectionManifest.answer_prompt_version !== ANSWER_PROMPT_VERSION) {
+    throw new Error("existing batch uses a different answer prompt version");
+  }
+  if (collectionManifest.history_ingest_order !== "haystack_dates-ascending-stable-v1") {
+    throw new Error("existing batch uses a different history ingest order");
+  }
+  if (collectionManifest.answer_model !== options.answerModel || collectionManifest.judge_model !== options.judgeModel) {
+    throw new Error("existing batch uses different answer/judge models");
   }
   const core = new CoreClient(coreUrl, userKey, teamId, userId);
   for (const entry of selected) {

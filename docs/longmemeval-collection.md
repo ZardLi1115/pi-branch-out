@@ -7,6 +7,10 @@
 session，并只写该 session 的 user/assistant 消息。写入完成并等待 pipeline 后，
 采集器只查询一次：
 
+oracle 文件不保证 session 顺序；采集器按 `haystack_dates` 升序稳定排序后写入，
+同时保留原 `haystack_session_id` 和源数组下标，避免 temporal / knowledge-update
+任务被文件排列顺序扰动。
+
 - L1：`POST /v3/atomic/search`，原问题作为 query，`limit=5`；
 - L3：`POST /v3/core/read`；
 - L2：`POST /v3/scenario/ls`。

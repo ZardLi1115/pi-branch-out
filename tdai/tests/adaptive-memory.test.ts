@@ -6,6 +6,7 @@ import { allocateProgressiveMemory, renderProgressiveMemory } from "../progressi
 import { chooseRatio, policyFeatures } from "../../extensions/tdai-budget-policy.ts";
 import { deterministicSample } from "../../extensions/tdai-model-call-collector.ts";
 import { planLongMemEvalActions, renderOpenClawL1 } from "../longmemeval-budget.ts";
+import { chronologicalSessionIndices } from "../../scripts/collect-longmemeval.ts";
 
 test("branch ratio scales candidate-aware feasible budget", () => {
   const decision = decideMemoryBudget({
@@ -161,4 +162,15 @@ test("LongMemEval plans preserve action zero and full OpenClaw recall", () => {
   assert.deepEqual(planned.plans.at(-1)?.selectedL1Ids, ["a", "b"]);
   assert.match(planned.plans.at(-1)?.renderedMemory ?? "", /^<relevant-memories>/);
   assert.equal(planned.feasibleBudgetTokens, planned.candidateTokens);
+});
+
+test("LongMemEval oracle sessions are ingested in chronological order", () => {
+  const entry = {
+    haystack_dates: [
+      "2023/05/30 (Tue) 23:40",
+      "2023/01/10 (Tue) 08:00",
+      "2023/01/10 (Tue) 08:00",
+    ],
+  };
+  assert.deepEqual(chronologicalSessionIndices(entry), [1, 2, 0]);
 });
