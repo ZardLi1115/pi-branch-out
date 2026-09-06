@@ -44,9 +44,7 @@ def evaluate(dataset: Path, policy_dir: Path) -> dict[str, Any]:
     for row in read_jsonl(dataset / "transitions.jsonl"):
         transitions[row["state_id"]][float(row["action"])] = row
 
-    splits: dict[str, Any] = {}
-    for split in ("train", "dev", "test"):
-        state_rows = [row for row in states.values() if row["split"] == split]
+    def metrics(state_rows: list[dict[str, Any]]) -> dict[str, Any]:
         policy_rows: list[dict[str, Any]] = []
         fixed: dict[float, list[float]] = defaultdict(list)
         for state_row in state_rows:
@@ -57,7 +55,7 @@ def evaluate(dataset: Path, policy_dir: Path) -> dict[str, Any]:
             policy_rows.append(observed)
             for fixed_action, row in available.items():
                 fixed[fixed_action].append(float(row["quality_reward"]))
-        splits[split] = {
+        return {
             "states": len(state_rows),
             "policy_quality": mean([float(row["quality_reward"]) for row in policy_rows]),
             "policy_reward": mean([float(row["reward"]) for row in policy_rows]),
@@ -80,6 +78,15 @@ def evaluate(dataset: Path, policy_dir: Path) -> dict[str, Any]:
                 for state_row in state_rows
             ]),
         }
+
+    splits: dict[str, Any] = {}
+    for split in ("train", "dev", "test"):
+        state_rows = [row for row in states.values() if row["split"] == split]
+        informative = [
+            row for row in state_rows
+            if len({float(item["quality_reward"]) for item in transitions[row["state_id"]].values()}) > 1
+        ]
+        splits[split] = {"all": metrics(state_rows), "informative": metrics(informative)}
     return {
         "schema_version": 1,
         "dataset_sha256": manifest.get("dataset_sha256"),

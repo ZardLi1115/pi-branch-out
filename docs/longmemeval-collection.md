@@ -135,6 +135,8 @@ python scripts/evaluate-longmemeval-policy.py `
 ```
 
 50 题阶段的 dev/test 仍太小，结果只用于训练接线验收，不用于替换默认策略。
+评估同时报告 `all` 与 `informative`：后者只包含至少两个 action 获得不同质量分的
+state，防止全档同分题让任意策略看起来同样优秀。
 
 beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动重试。若响应结果
 不确定，item 会写 `ingest-uncertain.json` 并隔离失败；必须换新 batch/namespace，
