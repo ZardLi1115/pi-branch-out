@@ -30,6 +30,7 @@ interface Options {
   pipelineSettleSeconds: number;
   pipelineTimeoutSeconds: number;
   hardCapTokens?: number;
+  requireActionDiversity: boolean;
 }
 
 const ANSWER_SYSTEM = `You answer questions about a user's prior conversations.
@@ -83,6 +84,7 @@ function parseOptions(argv: string[]): Options {
     pipelineSettleSeconds: parseNumber(argValue(argv, "--pipeline-settle-seconds"), 10, "--pipeline-settle-seconds"),
     pipelineTimeoutSeconds: parseNumber(argValue(argv, "--pipeline-timeout-seconds"), 1800, "--pipeline-timeout-seconds"),
     hardCapTokens: hardCap == null ? undefined : Math.floor(parseNumber(hardCap, 0, "--hard-cap-tokens")),
+    requireActionDiversity: argv.includes("--require-action-diversity"),
   };
 }
 
@@ -518,6 +520,10 @@ async function runItem(
     group.push(plan);
     byEffective.set(plan.effectiveActionId, group);
   }
+  if (options.requireActionDiversity && byEffective.size < 2) {
+    throw new Error("no action diversity: all budget ratios render identical L1 content");
+  }
+  const hasActionDiversity = byEffective.size >= 2;
   const results: Json[] = [];
   const existingSamples = _readJsonl(join(itemRoot, "samples.jsonl"));
   for (const [effectiveActionId, aliases] of byEffective) {
@@ -579,7 +585,7 @@ async function runItem(
       judge_usage: normalizedUsage(judgeResponse),
       done: true,
       truncated: false,
-      training_eligible: true,
+      training_eligible: hasActionDiversity,
     };
     results.push(result);
     appendJsonl(join(itemRoot, "samples.jsonl"), result);
@@ -613,6 +619,9 @@ async function main(): Promise<void> {
   mkdirSync(join(options.outputRoot, "items"), { recursive: true });
   mkdirSync(join(options.outputRoot, "hypotheses"), { recursive: true });
   const runtime = JSON.parse(readFileSync(options.runtime, "utf8"));
+  if (runtime.TDAI_PROMPT_MODE !== "chat") {
+    throw new Error("LongMemEval requires a dedicated TDAI runtime with TDAI_PROMPT_MODE=chat");
+  }
   const coreUrl = options.coreUrl ?? runtime.TDAI_CORE_URL;
   if (!coreUrl) throw new Error("MemoryCore URL missing (--core-url or runtime TDAI_CORE_URL)");
   const userKey = runtime.TDAI_USER_KEY;
@@ -639,6 +648,7 @@ async function main(): Promise<void> {
       data_sha256: sourceSha256,
       collection_id: `lme-${sha256(`${sourceSha256}\0${Date.now()}\0${Math.random()}`).slice(0, 16)}`,
       tdai_version: runtime.TDAI_VERSION,
+      tdai_prompt_mode: runtime.TDAI_PROMPT_MODE,
       answer_model: options.answerModel,
       judge_model: options.judgeModel,
       judge_protocol: options.judgeModel === "gpt-4o-2024-08-06" ? "official" : "official-prompt-custom-judge",

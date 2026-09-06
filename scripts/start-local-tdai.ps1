@@ -6,6 +6,7 @@ param(
     [string]$Model = "gpt-5.6-luna",
     [string]$CoreImage = "tdai-memory-core-local:v2.0.0-beta.1",
     [string]$ProxyImage = "tdai-memory-proxy-local:v2.0.0-beta.1",
+    [ValidateSet("code", "chat")][string]$PromptMode = "code",
     [int]$L1IdleTimeoutSeconds = 600,
     [int]$L2DelayAfterL1Seconds = 90,
     [int]$L2MinIntervalSeconds = 900,
@@ -93,7 +94,7 @@ llm:
   maxTokens: 32000
   timeoutMs: 300000
 memory:
-  promptMode: code
+  promptMode: $PromptMode
   capture: { enabled: true }
   extraction:
     enabled: true
@@ -331,6 +332,7 @@ $runtime = @{
     TDAI_USER_KEY = $adminKey
     TDAI_USER_ID = $userId
     TDAI_MODEL = $Model
+    TDAI_PROMPT_MODE = $PromptMode
     pipeline = @{
         l1_idle_timeout_seconds = $L1IdleTimeoutSeconds
         l2_delay_after_l1_seconds = $L2DelayAfterL1Seconds

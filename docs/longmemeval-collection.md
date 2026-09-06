@@ -28,13 +28,17 @@ allocator，并用 beta.1 OpenClaw 原生 `<relevant-memories>` 包装重新计�
 pwsh -File scripts/prepare-longmemeval.ps1
 
 pwsh -File scripts/start-local-tdai.ps1 `
-  -InstanceName longmemeval -CorePort 8422 -ProxyPort 8098 `
+  -InstanceName longmemeval-chat -CorePort 8423 -ProxyPort 8099 `
+  -PromptMode chat `
   -L1IdleTimeoutSeconds 2 -L2DelayAfterL1Seconds 2 `
   -L2MinIntervalSeconds 5 -L2MaxIntervalSeconds 30
 ```
 
 缩短的是离线灌库后的 pipeline 调度等待，不改变 L1 query、top-k、allocator 或
 回答动作。正式启动和冒烟必须由 `wake-run` 包装。
+
+`PromptMode=chat` 是 LongMemEval 的必要语义。RoadmapBench 实例默认使用
+`code`；该模式的 L1 提取规则会主动排除个人生活和个人偏好，不能用于本评测。
 
 先使用 oracle 做接线验证；它的 10,960 条消息全部满足 beta.1 的单条 8192 字符
 限制：
@@ -43,7 +47,7 @@ pwsh -File scripts/start-local-tdai.ps1 `
 pwsh -File scripts/run-longmemeval.ps1 `
   -Data .local-tdai/longmemeval-collection/source/longmemeval_oracle.json `
   -OutputRoot .local-tdai/longmemeval-collection/runs/oracle-v1 `
-  -Runtime .local-tdai/longmemeval/runtime.json `
+  -Runtime .local-tdai/longmemeval-chat/runtime.json `
   -Limit 1
 ```
 
