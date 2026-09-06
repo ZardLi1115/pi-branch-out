@@ -2,6 +2,7 @@
 param(
     [string]$CollectionRoot = ".local-tdai/longmemeval-collection",
     [string]$BatchName = "oracle-v1",
+    [string]$PolicyTag = "",
     [string]$Seeds = "7,17,29",
     [int]$CqlEpochs = 100
 )
@@ -13,6 +14,7 @@ $dataset = Join-Path $collection "training/$BatchName"
 if (-not (Test-Path -LiteralPath (Join-Path $dataset "dataset-manifest.json"))) {
     throw "Training dataset not found: $dataset"
 }
+if (-not $PolicyTag) { $PolicyTag = $BatchName }
 
 $parsedSeeds = $Seeds.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object {
     $value = 0
@@ -22,7 +24,7 @@ $parsedSeeds = $Seeds.Split(",", [System.StringSplitOptions]::RemoveEmptyEntries
 if ($parsedSeeds.Count -eq 0) { throw "At least one seed is required" }
 
 foreach ($seed in $parsedSeeds) {
-    $policyRoot = Join-Path $collection "policies/$BatchName-seed$seed"
+    $policyRoot = Join-Path $collection "policies/$PolicyTag-seed$seed"
     pi-branch-out train-policy `
         --dataset-dir $dataset `
         --output-dir $policyRoot `
