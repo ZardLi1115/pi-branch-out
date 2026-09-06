@@ -142,6 +142,11 @@ beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动�
 不确定，item 会写 `ingest-uncertain.json` 并隔离失败；必须换新 batch/namespace，
 不能在原 namespace 上猜测重跑。
 
+每个未完成 item 还会保存 `namespace.json`。基础设施中断后，部分写入的旧 item
+必须整体移入 outage audit，再由新 namespace 重新灌入；不能在旧 namespace 上重复
+追加。批量入口会恢复已有但停止的容器并等待健康，运行中快速连接失败会触发熔断，
+避免把后续题目全部标成独立数据失败。
+
 ## 超长 L0 边界
 
 cleaned-S 有 152/500 个实例含至少一条超过 8192 字符的干扰消息（没有 evidence

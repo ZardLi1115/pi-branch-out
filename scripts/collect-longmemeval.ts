@@ -129,6 +129,21 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 }
 
+function errorCode(error: unknown): string | undefined {
+  let current: any = error;
+  for (let depth = 0; current && depth < 6; depth += 1) {
+    if (typeof current.code === "string") return current.code;
+    current = current.cause;
+  }
+  return undefined;
+}
+
+function errorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = errorCode(error);
+  return code ? `${message} (${code})` : message;
+}
+
 async function fetchJson(url: string, init: RequestInit, attempts = 5): Promise<Json> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -386,6 +401,20 @@ async function runItem(
   const completePath = join(itemRoot, "complete.json");
   if (existsSync(completePath)) return { question_id: questionId, status: "already-complete" };
 
+  const namespacePath = join(itemRoot, "namespace.json");
+  const ingestLog = join(itemRoot, "ingest.jsonl");
+  if (existsSync(ingestLog) && !existsSync(namespacePath)) {
+    throw new Error("legacy incomplete item has no retry-safe namespace; quarantine it before retrying");
+  }
+  const namespace = existsSync(namespacePath)
+    ? JSON.parse(readFileSync(namespacePath, "utf8"))
+    : {
+        schema_version: "longmemeval-item-namespace-v1",
+        namespace_id: `ns-${sha256(`${questionId}\0${Date.now()}\0${Math.random()}`).slice(0, 16)}`,
+        created_at: new Date().toISOString(),
+      };
+  if (!existsSync(namespacePath)) writeJson(namespacePath, namespace);
+
   let prepared: ReturnType<typeof prepareMessages>;
   try {
     prepared = prepareMessages(entry, options);
@@ -398,8 +427,7 @@ async function runItem(
     throw error;
   }
 
-  const agentId = `agt-lme-${sha256(`${collectionId}\0${questionId}`).slice(0, 16)}`;
-  const ingestLog = join(itemRoot, "ingest.jsonl");
+  const agentId = `agt-lme-${sha256(`${collectionId}\0${questionId}\0${namespace.namespace_id}`).slice(0, 16)}`;
   const uncertainIngestPath = join(itemRoot, "ingest-uncertain.json");
   if (existsSync(uncertainIngestPath)) {
     throw new Error("previous conversation/add outcome is uncertain; use a new collection batch/namespace");
@@ -411,7 +439,7 @@ async function runItem(
   for (const session of prepared.sessions) {
     const messages = session.messages;
     const sourceSessionId = session.sourceSessionId;
-    const sessionId = `lme-${sha256(`${questionId}\0${sourceSessionId}`).slice(0, 24)}`;
+    const sessionId = `lme-${sha256(`${questionId}\0${namespace.namespace_id}\0${sourceSessionId}`).slice(0, 24)}`;
     for (let start = 0; start < messages.length; start += 100) {
       const batch = messages.slice(start, start + 100);
       acceptedMessages += batch.length;
@@ -427,7 +455,7 @@ async function runItem(
           memory_session_id: sessionId,
           batch_start: start,
           message_count: batch.length,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorMessage(error),
           at: new Date().toISOString(),
         });
         throw error;
@@ -739,12 +767,15 @@ async function main(): Promise<void> {
       const failure = {
         question_id: entry.question_id,
         status: "failed",
-        error: error instanceof Error ? error.message : String(error),
+        error: errorMessage(error),
         elapsed_ms: Date.now() - startedAt,
         at: new Date().toISOString(),
       };
       appendJsonl(join(options.outputRoot, "status.jsonl"), failure);
       process.stderr.write(`${JSON.stringify(failure)}\n`);
+      if (failure.elapsed_ms < 1000 && /fetch failed|ECONNREFUSED|ECONNRESET/.test(failure.error)) {
+        throw new Error(`infrastructure circuit breaker: ${failure.error}`);
+      }
       if (!options.continueOnError) throw error;
     }
   }
