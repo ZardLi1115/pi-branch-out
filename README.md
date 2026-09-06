@@ -1,6 +1,37 @@
 # pi-branch-out
 
-用于 **Pi + TDAI Memory + Harbor / RoadmapBench** 的结构化 Branch-out 数据采集。仓库中的 EvoCodeBench 目录仅保留为多 step 接线示例，不进入预算策略训练或正式评测。
+用于 **TDAI Memory Budget Policy** 的结构化数据采集与离线 RL。第一版主路径改为
+**LongMemEval + TencentDB-Agent-Memory v2.0.0-beta.1**：历史逐 session 写入
+MemoryCore，在同一份冻结候选上执行多个 L1 Budget Action，并用 LongMemEval
+标准答案评分。RoadmapBench / Harbor 保留为后续长程反事实路径。
+
+## LongMemEval 单步主路径
+
+每道题使用独立 agent namespace，按官方 `haystack_session_ids` 保留会话边界：
+
+```text
+history sessions → MemoryCore L0 → beta.1 pipeline L1/L2/L3
+                                  ↓
+question → top-5 L1 + Persona + Scene Navigation（冻结一次）
+                                  ↓
+0 / 0.2 / 0.4 / 0.6 / 0.8 / 1.0 → answer → LongMemEval judge
+```
+
+L2/L3 是所有动作共享的固定状态；动作只控制自动注入的 L1。`1.0` 精确对应
+beta.1 OpenClaw 的完整 top-5 L1 默认行为，`0` 不注入 L1。内容相同的预算档位
+只调用一次 answer/judge，并记录为等价 action aliases。
+
+所有 LongMemEval 源数据、运行产物和训练导出集中在：
+
+```text
+.local-tdai/longmemeval-collection/
+├── source/
+├── runs/
+└── training/
+```
+
+完整准备、运行、数据合同和限制见
+[`docs/longmemeval-collection.md`](docs/longmemeval-collection.md)。
 
 这套代码有一个硬边界：**不修改 TencentDB-Agent-Memory、MemoryCore 或 MemoryProxy 源码。** TDAI 只作为现成服务使用。我们通过官方 Pi 插件走 TDAI Proxy，并通过现有只读 `memory-bridge` 冻结 L1/L0 候选；Budget Controller、上下文分配和 Branch-out 全部发生在本仓库与 Pi extension 侧。
 

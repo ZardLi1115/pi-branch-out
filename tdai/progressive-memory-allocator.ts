@@ -30,6 +30,8 @@ export interface AllocationInput {
   budgetTokens: number;
   /** Counts the complete rendered injection, including wrappers and metadata. */
   countRenderedTokens?: (rendered: string) => number;
+  /** Workloads may supply their protocol-native wrapper while reusing allocation. */
+  renderResult?: (result: AllocationResult) => string;
 }
 
 export interface SelectedL1 extends L1Candidate {
@@ -70,8 +72,12 @@ function emptyResult(): AllocationResult {
   };
 }
 
-function measuredTokens(result: AllocationResult, counter?: (rendered: string) => number): number {
-  if (counter) return Math.max(0, Math.floor(counter(renderProgressiveMemory(result))));
+function measuredTokens(
+  result: AllocationResult,
+  counter?: (rendered: string) => number,
+  renderer: (result: AllocationResult) => string = renderProgressiveMemory,
+): number {
+  if (counter) return Math.max(0, Math.floor(counter(renderer(result))));
   return result.l1Tokens + result.l0Tokens;
 }
 
@@ -115,7 +121,7 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
     const selected: SelectedL1 = { ...candidate, selectedL0: [] };
     result.selected.push(selected);
     result.l1Tokens += Math.floor(candidate.tokenCount);
-    const trialTokens = measuredTokens(result, input.countRenderedTokens);
+    const trialTokens = measuredTokens(result, input.countRenderedTokens, input.renderResult);
     if (trialTokens > budgetTokens) {
       result.selected.pop();
       result.l1Tokens -= Math.floor(candidate.tokenCount);
@@ -136,7 +142,7 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
     if (owner) owner.selectedL0.push(chunk);
     else result.selectedIndependentL0.push(chunk);
     result.l0Tokens += Math.floor(chunk.tokenCount);
-    const trialTokens = measuredTokens(result, input.countRenderedTokens);
+    const trialTokens = measuredTokens(result, input.countRenderedTokens, input.renderResult);
     if (trialTokens > budgetTokens) {
       if (owner) owner.selectedL0.pop();
       else result.selectedIndependentL0.pop();
@@ -148,7 +154,7 @@ export function allocateProgressiveMemory(input: AllocationInput): AllocationRes
     result.injectedTokens = trialTokens;
   }
 
-  result.injectedTokens = measuredTokens(result, input.countRenderedTokens);
+  result.injectedTokens = measuredTokens(result, input.countRenderedTokens, input.renderResult);
   if (result.injectedTokens > budgetTokens) throw new Error("rendered memory exceeds budget");
   return result;
 }

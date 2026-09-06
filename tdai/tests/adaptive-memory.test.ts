@@ -5,6 +5,7 @@ import { decideMemoryBudget } from "../memory-budget-controller.ts";
 import { allocateProgressiveMemory, renderProgressiveMemory } from "../progressive-memory-allocator.ts";
 import { chooseRatio, policyFeatures } from "../../extensions/tdai-budget-policy.ts";
 import { deterministicSample } from "../../extensions/tdai-model-call-collector.ts";
+import { planLongMemEvalActions, renderOpenClawL1 } from "../longmemeval-budget.ts";
 
 test("branch ratio scales candidate-aware feasible budget", () => {
   const decision = decideMemoryBudget({
@@ -124,4 +125,40 @@ test("checkpoint sampling is deterministic and bounded", () => {
   assert.equal(first, second);
   assert.ok(first >= 0 && first < 1);
   assert.notEqual(first, deterministicSample("task", "batch", 18));
+});
+
+test("allocator recounts a workload-native OpenClaw wrapper", () => {
+  const candidates = [
+    { id: "a", content: "alpha", type: "episodic", tokenCount: 1, l0: [] },
+    { id: "b", content: "beta", type: "persona", tokenCount: 1, l0: [] },
+  ];
+  const full = allocateProgressiveMemory({
+    candidates,
+    budgetTokens: 10_000,
+    countRenderedTokens: (value) => value.length,
+    renderResult: renderOpenClawL1,
+  });
+  const constrained = allocateProgressiveMemory({
+    candidates,
+    budgetTokens: full.injectedTokens - 1,
+    countRenderedTokens: (value) => value.length,
+    renderResult: renderOpenClawL1,
+  });
+  assert.equal(full.injectedTokens, renderOpenClawL1(full).length);
+  assert.deepEqual(constrained.selected.map((item) => item.id), ["a"]);
+  assert.ok(constrained.injectedTokens <= full.injectedTokens - 1);
+});
+
+test("LongMemEval plans preserve action zero and full OpenClaw recall", () => {
+  const planned = planLongMemEvalActions({
+    items: [
+      { id: "a", content: "user likes cafe A", type: "persona" },
+      { id: "b", content: "user visited cafe B", type: "episodic" },
+    ],
+  });
+  assert.equal(planned.plans[0].action, 0);
+  assert.equal(planned.plans[0].renderedMemory, "");
+  assert.deepEqual(planned.plans.at(-1)?.selectedL1Ids, ["a", "b"]);
+  assert.match(planned.plans.at(-1)?.renderedMemory ?? "", /^<relevant-memories>/);
+  assert.equal(planned.feasibleBudgetTokens, planned.candidateTokens);
 });

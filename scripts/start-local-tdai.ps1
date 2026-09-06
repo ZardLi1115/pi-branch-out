@@ -6,6 +6,10 @@ param(
     [string]$Model = "gpt-5.6-luna",
     [string]$CoreImage = "tdai-memory-core-local:v2.0.0-beta.1",
     [string]$ProxyImage = "tdai-memory-proxy-local:v2.0.0-beta.1",
+    [int]$L1IdleTimeoutSeconds = 600,
+    [int]$L2DelayAfterL1Seconds = 90,
+    [int]$L2MinIntervalSeconds = 900,
+    [int]$L2MaxIntervalSeconds = 3600,
     [switch]$Recreate
 )
 
@@ -101,10 +105,10 @@ memory:
   pipeline:
     everyNConversations: 5
     enableWarmup: true
-    l1IdleTimeoutSeconds: 600
-    l2DelayAfterL1Seconds: 90
-    l2MinIntervalSeconds: 900
-    l2MaxIntervalSeconds: 3600
+    l1IdleTimeoutSeconds: $L1IdleTimeoutSeconds
+    l2DelayAfterL1Seconds: $L2DelayAfterL1Seconds
+    l2MinIntervalSeconds: $L2MinIntervalSeconds
+    l2MaxIntervalSeconds: $L2MaxIntervalSeconds
   recall:
     enabled: true
     maxResults: 36
@@ -316,6 +320,7 @@ Wait-Http "http://127.0.0.1:$ProxyPort/health"
 $runtime = @{
     instance_name = $InstanceName
     TDAI_PROXY_URL = "http://127.0.0.1:$ProxyPort"
+    TDAI_CORE_URL = "http://127.0.0.1:$CorePort"
     TDAI_SPACE_ID = "default"
     TDAI_AGENT_SOURCE = "codebuddy"
     TDAI_WIRE_API = "chat-completions"
@@ -324,7 +329,14 @@ $runtime = @{
     TDAI_AGENT_ID = $agentId
     TDAI_TASK_ID = $taskId
     TDAI_USER_KEY = $adminKey
+    TDAI_USER_ID = $userId
     TDAI_MODEL = $Model
+    pipeline = @{
+        l1_idle_timeout_seconds = $L1IdleTimeoutSeconds
+        l2_delay_after_l1_seconds = $L2DelayAfterL1Seconds
+        l2_min_interval_seconds = $L2MinIntervalSeconds
+        l2_max_interval_seconds = $L2MaxIntervalSeconds
+    }
     core_container = $coreContainer
     proxy_container = $proxyContainer
     core_volume = $coreVolume
