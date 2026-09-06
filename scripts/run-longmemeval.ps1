@@ -6,11 +6,13 @@ param(
     [int]$Offset = 0,
     [int]$Limit = 0,
     [string]$QuestionId = "",
+    [string]$QuestionIdsFile = "",
     [string]$Ratios = "0,0.2,0.4,0.6,0.8,1",
     [ValidateSet("error", "skip-instance", "truncate")][string]$OverlongPolicy = "error",
     [string]$AnswerModel = "gpt-5.6-luna",
     [string]$JudgeModel = "gpt-5.6-luna",
-    [switch]$RequireActionDiversity
+    [switch]$RequireActionDiversity,
+    [switch]$ContinueOnError
 )
 
 $ErrorActionPreference = "Stop"
@@ -42,7 +44,9 @@ try {
     )
     if ($Limit -gt 0) { $arguments += @("--limit", [string]$Limit) }
     if ($QuestionId) { $arguments += @("--question-id", $QuestionId) }
+    if ($QuestionIdsFile) { $arguments += @("--question-ids-file", (Resolve-Path -LiteralPath $QuestionIdsFile).Path) }
     if ($RequireActionDiversity) { $arguments += "--require-action-diversity" }
+    if ($ContinueOnError) { $arguments += "--continue-on-error" }
     & npx @arguments
     if ($LASTEXITCODE -ne 0) { throw "LongMemEval collection failed with exit code $LASTEXITCODE" }
 }

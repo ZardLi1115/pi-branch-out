@@ -25,12 +25,14 @@ interface Options {
   offset: number;
   limit?: number;
   questionId?: string;
+  questionIdsFile?: string;
   maxAnswerTokens: number;
   overlongPolicy: OverlongPolicy;
   pipelineSettleSeconds: number;
   pipelineTimeoutSeconds: number;
   hardCapTokens?: number;
   requireActionDiversity: boolean;
+  continueOnError: boolean;
 }
 
 const ANSWER_SYSTEM = "You answer questions about a user's prior conversations. Return a concise final answer.";
@@ -79,12 +81,14 @@ function parseOptions(argv: string[]): Options {
     offset: Math.floor(parseNumber(argValue(argv, "--offset"), 0, "--offset")),
     limit: limit == null ? undefined : Math.floor(parseNumber(limit, 0, "--limit")),
     questionId: argValue(argv, "--question-id"),
+    questionIdsFile: argValue(argv, "--question-ids-file"),
     maxAnswerTokens: Math.floor(parseNumber(argValue(argv, "--max-answer-tokens"), 512, "--max-answer-tokens")),
     overlongPolicy,
     pipelineSettleSeconds: parseNumber(argValue(argv, "--pipeline-settle-seconds"), 10, "--pipeline-settle-seconds"),
     pipelineTimeoutSeconds: parseNumber(argValue(argv, "--pipeline-timeout-seconds"), 1800, "--pipeline-timeout-seconds"),
     hardCapTokens: hardCap == null ? undefined : Math.floor(parseNumber(hardCap, 0, "--hard-cap-tokens")),
     requireActionDiversity: argv.includes("--require-action-diversity"),
+    continueOnError: argv.includes("--continue-on-error"),
   };
 }
 
@@ -495,6 +499,9 @@ async function runItem(
     l1_count: recalled.l1.length,
     l1_lengths: recalled.l1.map((item) => item.content.length),
     l1_scores: recalled.l1.map((item) => item.score ?? null),
+    l1_contents: recalled.l1.map((item) => item.content),
+    persona_text: recalled.persona ?? "",
+    scene_paths: recalled.scenes.map((scene) => scene.path),
     persona_chars: recalled.persona?.length ?? 0,
     scene_count: recalled.scenes.length,
     candidate_tokens: planned.candidateTokens,
@@ -654,8 +661,24 @@ async function main(): Promise<void> {
   const entries = JSON.parse(readFileSync(options.data, "utf8"));
   if (!Array.isArray(entries)) throw new Error("LongMemEval data must be a JSON array");
   let selected = entries as Json[];
-  if (options.questionId) selected = selected.filter((entry) => entry.question_id === options.questionId);
-  else selected = selected.slice(options.offset, options.limit == null ? undefined : options.offset + options.limit);
+  let selectionSha256: string | null = null;
+  if (options.questionId && options.questionIdsFile) throw new Error("use either --question-id or --question-ids-file");
+  if (options.questionId) {
+    selected = selected.filter((entry) => entry.question_id === options.questionId);
+  } else if (options.questionIdsFile) {
+    const selectionText = readFileSync(resolve(options.questionIdsFile), "utf8");
+    selectionSha256 = sha256(selectionText);
+    const parsed = JSON.parse(selectionText);
+    const ids = Array.isArray(parsed) ? parsed : parsed.question_ids;
+    if (!Array.isArray(ids)) throw new Error("selection file must contain question_ids array");
+    const byId = new Map(selected.map((entry) => [String(entry.question_id), entry]));
+    const missing = ids.map((id: unknown) => String(id)).filter((id: string) => !byId.has(id));
+    if (missing.length > 0) throw new Error(`selection contains unknown question IDs: ${missing.slice(0, 5).join(",")}`);
+    selected = ids.map((id: unknown) => byId.get(String(id))) as Json[];
+    selected = selected.slice(options.offset, options.limit == null ? undefined : options.offset + options.limit);
+  } else {
+    selected = selected.slice(options.offset, options.limit == null ? undefined : options.offset + options.limit);
+  }
   if (selected.length === 0) throw new Error("no LongMemEval entries selected");
 
   const sourceSha256 = sha256(readFileSync(options.data));
@@ -666,6 +689,7 @@ async function main(): Promise<void> {
       schema_version: "longmemeval-budget-collection-v1",
       data_file: options.data,
       data_sha256: sourceSha256,
+      selection_sha256: selectionSha256,
       collection_id: `lme-${sha256(`${sourceSha256}\0${Date.now()}\0${Math.random()}`).slice(0, 16)}`,
       tdai_version: runtime.TDAI_VERSION,
       tdai_prompt_mode: runtime.TDAI_PROMPT_MODE,
@@ -686,6 +710,9 @@ async function main(): Promise<void> {
   }
   const collectionManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   if (collectionManifest.data_sha256 !== sourceSha256) throw new Error("existing batch uses a different source dataset");
+  if ((collectionManifest.selection_sha256 ?? null) !== selectionSha256) {
+    throw new Error("existing batch uses a different question selection");
+  }
   if (stableJson(collectionManifest.action_ratios) !== stableJson(options.ratios)) {
     throw new Error("existing batch uses a different action table");
   }
@@ -718,7 +745,7 @@ async function main(): Promise<void> {
       };
       appendJsonl(join(options.outputRoot, "status.jsonl"), failure);
       process.stderr.write(`${JSON.stringify(failure)}\n`);
-      throw error;
+      if (!options.continueOnError) throw error;
     }
   }
 }

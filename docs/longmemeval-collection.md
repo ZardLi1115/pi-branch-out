@@ -85,6 +85,19 @@ runs/<batch>/
 evidence session IDs 和任何截断记录。候选原文、score、Persona、场景路径及原始 API
 响应保存在 `candidate-snapshot.json`。
 
+在线 state 同时保存 top-5 `l1_contents`、`persona_text` 和 `scene_paths`；这些都是
+决策时可见信息，后续可由固定编码器构建 MLP 特征，标准答案不会进入 state。
+
+可续跑批量入口会逐题记录失败并继续，已完成题不会重复写入：
+
+```powershell
+pwsh -File scripts/run-longmemeval-batch.ps1 -BatchName oracle-v1 -Limit 20
+```
+
+批量入口使用固定 `oracle-stratified-v1.json`：六种 question type 与 abstention
+先在各层内按哈希稳定排序，再轮转组成 500 题顺序。因此把同一 batch 从 `Limit 20`
+扩大到 `Limit 50` 不会改变前 20 题，也不会误采文件开头单一题型。
+
 训练导出：
 
 ```powershell

@@ -20,6 +20,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 def summarize(root: Path) -> dict[str, Any]:
     manifest = read_json(root / "dataset-manifest.json")
     statuses = read_jsonl(root / "status.jsonl")
+    latest_status = {str(row.get("question_id")): row for row in statuses}
     nominal_rewards: dict[float, list[float]] = defaultdict(list)
     total_input = total_output = total_cache_read = total_judge_input = 0.0
     completed = diverse = effective_actions = aliases = 0
@@ -62,8 +63,9 @@ def summarize(root: Path) -> dict[str, Any]:
         "answer_prompt_version": manifest.get("answer_prompt_version"),
         "judge_model": manifest.get("judge_model"),
         "status_rows": len(statuses),
+        "unique_status_items": len(latest_status),
         "completed_items": completed,
-        "failed_items": sum(row.get("status") == "failed" for row in statuses),
+        "failed_items": sum(row.get("status") == "failed" for row in latest_status.values()),
         "diverse_items": diverse,
         "nonempty_l1_items": sum(value > 0 for value in l1_counts),
         "mean_l1_count": sum(l1_counts) / len(l1_counts) if l1_counts else 0.0,
