@@ -133,8 +133,20 @@ pwsh -File scripts/run-longmemeval-cost-sweep.ps1 `
 
 等价 action 会在训练导出中展开为全部 nominal ratio，但共享同一真实 observation，
 并设置 `sample_weight=1/alias_count`。这样 CQL 不会把已证实等价的 ratio 当成未观测
-动作，同时同一 API 结果在 loss 中的总权重仍为 1，不会虚增证据量。特征版本
-`visible-state-hash-v4-memory-text` 会编码 query、top-5 L1 原文、Persona 和场景路径。
+动作，同时同一 API 结果在 loss 中的总权重仍为 1，不会虚增证据量。旧特征版本
+`visible-state-hash-v4-memory-text` 会把 query、top-5 L1、Persona 和场景路径放入同一
+哈希空间。实验版 `visible-state-hash-v5-positional-l1-actions` 将五个 L1 位置分槽编码，
+并加入六档动作的预算、实际注入 Token 和选中 L1 数量；这些字段来自冻结 action plan，
+不包含回答或评分结果。
+
+训练器支持 `--select-best-dev`，按 dev 平均 reward 选择 epoch，同 reward 时选择平均
+注入 Token 更低的 checkpoint。`--cql-alpha` 与成本系数是独立参数，可用以下入口做
+固定的 CQL 消融和位置特征消融：
+
+```powershell
+pwsh -File scripts/run-longmemeval-cql-alpha-sweep.ps1
+pwsh -File scripts/run-longmemeval-positional-sweep.ps1
+```
 
 小模型训练后必须用同一批次的配对 dev/test action 做离线冻结评估：
 
@@ -153,6 +165,13 @@ python scripts/evaluate-longmemeval-policy.py `
 评估同时报告 `all` 与 `informative`：后者只包含至少两个 action 获得不同质量分的
 state，防止全档同分题让任意策略看起来同样优秀。固定预算除质量外还报告平均
 L1 注入 Token，便于按预先确定的质量容忍范围比较成本，而不是只按准确率选策略。
+评估器还输出相对 top-5 不降质量的事后最小 Token、默认正确题子集、策略与默认的
+四象限损益、按 question 配对的 bootstrap CI，以及 `evaluation-pairs.jsonl`。
+
+实验性的默认保护门可通过 `run-longmemeval-safe-gate.ps1` 运行。它只在 dev 上校准，
+要求候选阈值没有 `fixed1_only_correct`，再以最小 Token 选择 group/阈值并冻结到 test。
+该规则是经验门控，不提供逐题或分布外安全保证；若 test 质量不满足预先规定的容忍范围，
+必须保留默认 top-5。
 
 beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动重试。若响应结果
 不确定，item 会写 `ingest-uncertain.json` 并隔离失败；必须换新 batch/namespace，

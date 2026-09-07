@@ -287,6 +287,8 @@ def run_train_policy(args: argparse.Namespace) -> int:
         learning_rate=args.learning_rate,
         cql_alpha=args.cql_alpha,
         gamma=args.gamma,
+        select_best_dev=args.select_best_dev,
+        feature_version=args.feature_version,
     )
     print(json.dumps(result, ensure_ascii=False), flush=True)
     return 0
@@ -606,6 +608,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--learning-rate", type=float, default=1e-3)
     train.add_argument("--cql-alpha", type=float, default=1.0)
     train.add_argument("--gamma", type=float, default=1.0)
+    train.add_argument("--select-best-dev", action="store_true")
+    train.add_argument(
+        "--feature-version",
+        choices=("visible-state-hash-v4-memory-text", "visible-state-hash-v5-positional-l1-actions"),
+        default="visible-state-hash-v4-memory-text",
+    )
     train.set_defaults(func=run_train_policy)
 
     score = sub.add_parser("score-checkpoint", help="Restore one checkpoint in an isolated Harbor task and run the official verifier")

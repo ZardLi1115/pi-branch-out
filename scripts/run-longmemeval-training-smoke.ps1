@@ -4,7 +4,10 @@ param(
     [string]$BatchName = "oracle-v1",
     [string]$PolicyTag = "",
     [string]$Seeds = "7,17,29",
-    [int]$CqlEpochs = 100
+    [int]$CqlEpochs = 100,
+    [double]$CqlAlpha = 1.0,
+    [switch]$SelectBestDev,
+    [string]$FeatureVersion = "visible-state-hash-v4-memory-text"
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,11 +28,17 @@ if ($parsedSeeds.Count -eq 0) { throw "At least one seed is required" }
 
 foreach ($seed in $parsedSeeds) {
     $policyRoot = Join-Path $collection "policies/$PolicyTag-seed$seed"
-    pi-branch-out train-policy `
-        --dataset-dir $dataset `
-        --output-dir $policyRoot `
-        --seed $seed `
-        --cql-epochs $CqlEpochs
+    $trainArgs = @(
+        "train-policy",
+        "--dataset-dir", $dataset,
+        "--output-dir", $policyRoot,
+        "--seed", $seed,
+        "--cql-epochs", $CqlEpochs,
+        "--cql-alpha", $CqlAlpha,
+        "--feature-version", $FeatureVersion
+    )
+    if ($SelectBestDev) { $trainArgs += "--select-best-dev" }
+    pi-branch-out @trainArgs
     if ($LASTEXITCODE -ne 0) { throw "Policy training failed for seed $seed" }
 
     python (Join-Path $PSScriptRoot "evaluate-longmemeval-policy.py") `

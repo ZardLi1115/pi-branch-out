@@ -66,6 +66,8 @@ def test_longmemeval_export_can_use_injected_l1_cost_and_stable_subset(tmp_path:
             "action_aliases": [1],
             "reward": 1,
             "injected_tokens": injected_tokens,
+            "budget_tokens": injected_tokens,
+            "selected_l1_ids": [question_id] if injected_tokens else [],
             "answer_usage": {"input_tokens": 1000, "output_tokens": 100},
         }) + "\n", encoding="utf-8")
     _json(root / "dataset-manifest.json", {
@@ -84,6 +86,7 @@ def test_longmemeval_export_can_use_injected_l1_cost_and_stable_subset(tmp_path:
         cost_measure="injected-l1-tokens",
         question_ids_file=selection,
         limit=1,
+        include_action_features=True,
     )
     transitions = [json.loads(line) for line in (output / "transitions.jsonl").read_text().splitlines()]
     assert len(transitions) == 1
@@ -93,6 +96,10 @@ def test_longmemeval_export_can_use_injected_l1_cost_and_stable_subset(tmp_path:
     assert manifest["unique_states"] == 1
     assert manifest["cost_measure"] == "injected-l1-tokens"
     assert manifest["question_ids_limit"] == 1
+    state = json.loads((output / "state-prefixes.jsonl").read_text().splitlines()[0])["state"]
+    assert state["action_injected_tokens"] == [75]
+    assert state["action_selected_l1_counts"] == [1]
+    assert manifest["state_action_features"] == "budget-injected-selected-counts-v1"
 
 
 def test_longmemeval_split_is_stable() -> None:

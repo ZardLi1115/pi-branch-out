@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--split-seed", default="longmemeval-v1")
     parser.add_argument("--question-ids-file", type=Path)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--include-action-features", action="store_true")
     args = parser.parse_args()
     result = export_longmemeval_training(
         args.collection_root,
@@ -31,6 +32,7 @@ def main() -> None:
         split_seed=args.split_seed,
         question_ids_file=args.question_ids_file,
         limit=args.limit,
+        include_action_features=args.include_action_features,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

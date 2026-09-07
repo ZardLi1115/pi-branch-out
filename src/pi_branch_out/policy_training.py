@@ -10,6 +10,8 @@ from typing import Any
 
 
 HASH_DIM = 128
+POSITIONAL_HASH_DIM = 32
+MAX_L1_SLOTS = 5
 NUMERIC_KEYS = (
     "context_tokens", "context_window_tokens", "reserve_tokens",
     "remaining_call_budget", "remaining_cost_budget_usd", "remaining_time_seconds",
@@ -18,6 +20,8 @@ NUMERIC_KEYS = (
     "previous_mapped_action", "previous_budget_tokens",
 )
 FEATURE_VERSION = "visible-state-hash-v4-memory-text"
+POSITIONAL_FEATURE_VERSION = "visible-state-hash-v5-positional-l1-actions"
+SUPPORTED_FEATURE_VERSIONS = (FEATURE_VERSION, POSITIONAL_FEATURE_VERSION)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -33,24 +37,27 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def _text_features(text: str) -> list[float]:
-    result = [0.0] * HASH_DIM
+def _text_features(text: str, *, dim: int = HASH_DIM) -> list[float]:
+    result = [0.0] * dim
     tokens = re.findall(r"[A-Za-z0-9_-]+|[^\x00-\x7f]", text.lower())
     for token in tokens:
         digest = hashlib.sha256(token.encode("utf-8")).digest()
-        index = int.from_bytes(digest[:4], "big") % HASH_DIM
+        index = int.from_bytes(digest[:4], "big") % dim
         sign = 1.0 if digest[4] & 1 else -1.0
         result[index] += sign
     norm = math.sqrt(sum(value * value for value in result)) or 1.0
     return [value / norm for value in result]
 
 
-def state_features(state: dict[str, Any]) -> list[float]:
+def _numeric_value(raw: Any) -> float:
+    value = float(raw) if isinstance(raw, (int, float)) and math.isfinite(float(raw)) else 0.0
+    return math.copysign(math.log1p(abs(value)), value)
+
+
+def _legacy_state_features(state: dict[str, Any]) -> list[float]:
     numeric: list[float] = []
     for key in NUMERIC_KEYS:
-        raw = state.get(key)
-        value = float(raw) if isinstance(raw, (int, float)) and math.isfinite(float(raw)) else 0.0
-        numeric.append(math.copysign(math.log1p(abs(value)), value))
+        numeric.append(_numeric_value(state.get(key)))
     for key in ("l1_lengths", "l0_lengths", "l1_scores", "l0_scores"):
         values = [float(item) for item in (state.get(key) or []) if isinstance(item, (int, float))]
         if values:
@@ -64,6 +71,46 @@ def state_features(state: dict[str, Any]) -> list[float]:
         f"{visible_memory}\n{state.get('persona_text', '')}\n{scene_paths}"
     )
     return numeric + _text_features(text)
+
+
+def _positional_state_features(state: dict[str, Any]) -> list[float]:
+    numeric = [_numeric_value(state.get(key)) for key in NUMERIC_KEYS]
+    for key in ("l1_lengths", "l0_lengths", "l1_scores", "l0_scores"):
+        values = [float(item) for item in (state.get(key) or []) if isinstance(item, (int, float))]
+        stats = (len(values), sum(values) / len(values), min(values), max(values)) if values else (0, 0, 0, 0)
+        numeric.extend(_numeric_value(value) for value in stats)
+    for key in ("action_budget_tokens", "action_injected_tokens", "action_selected_l1_counts"):
+        values = list(state.get(key) or [])
+        numeric.extend(_numeric_value(values[index] if index < len(values) else 0) for index in range(6))
+
+    scene_paths = "\n".join(str(value) for value in (state.get("scene_paths") or []))
+    general_text = (
+        f"query\n{state.get('query', '')}\nrecent\n{state.get('recent_tool_result', '')}\n"
+        f"persona\n{state.get('persona_text', '')}\nscene\n{scene_paths}"
+    )
+    features = numeric + _text_features(general_text)
+    contents = list(state.get("l1_contents") or [])
+    lengths = list(state.get("l1_lengths") or [])
+    scores = list(state.get("l1_scores") or [])
+    for index in range(MAX_L1_SLOTS):
+        present = index < len(contents)
+        features.extend((
+            1.0 if present else 0.0,
+            index / max(1, MAX_L1_SLOTS - 1) if present else 0.0,
+            _numeric_value(lengths[index] if index < len(lengths) else 0),
+            _numeric_value(scores[index] if index < len(scores) else 0),
+        ))
+        text = f"l1_position={index}\n{contents[index]}" if present else ""
+        features.extend(_text_features(text, dim=POSITIONAL_HASH_DIM) if present else [0.0] * POSITIONAL_HASH_DIM)
+    return features
+
+
+def state_features(state: dict[str, Any], *, feature_version: str = FEATURE_VERSION) -> list[float]:
+    if feature_version == FEATURE_VERSION:
+        return _legacy_state_features(state)
+    if feature_version == POSITIONAL_FEATURE_VERSION:
+        return _positional_state_features(state)
+    raise ValueError(f"unsupported feature_version: {feature_version}")
 
 
 @dataclass
@@ -153,11 +200,15 @@ def train_policy(
     learning_rate: float = 1e-3,
     cql_alpha: float = 1.0,
     gamma: float = 1.0,
+    select_best_dev: bool = False,
+    feature_version: str = FEATURE_VERSION,
 ) -> dict[str, Any]:
     if hidden_dim <= 0 or batch_size <= 0 or pretrain_epochs < 0 or cql_epochs <= 0:
         raise ValueError("hidden_dim, batch_size and cql_epochs must be positive; pretrain_epochs may be zero")
     if learning_rate <= 0 or cql_alpha < 0 or not 0 <= gamma <= 1:
         raise ValueError("learning_rate must be positive, cql_alpha non-negative, and gamma within [0, 1]")
+    if feature_version not in SUPPORTED_FEATURE_VERSIONS:
+        raise ValueError(f"unsupported feature_version: {feature_version}")
     try:
         import numpy as np
     except ImportError as exc:
@@ -174,11 +225,15 @@ def train_policy(
         row for row in _read_jsonl(dataset_dir / "transitions.jsonl")
         if row.get("training_eligible") and row.get("split") == "train"
     ]
+    dev_transitions = [
+        row for row in _read_jsonl(dataset_dir / "transitions.jsonl")
+        if row.get("training_eligible") and row.get("split") == "dev"
+    ]
     if not transitions:
         raise ValueError("no training-eligible real-action transitions")
 
     first = next(iter(prefixes.values()))["state"]
-    input_dim = len(state_features(first))
+    input_dim = len(state_features(first, feature_version=feature_version))
     online = MLP(input_dim, hidden_dim, len(actions), seed)
     target = MLP(input_dim, hidden_dim, len(actions), seed + 1)
     target.copy_from(online)
@@ -191,7 +246,9 @@ def train_policy(
         online.b2[_action_index(0.0, actions)] = 1.0
         target.copy_from(online)
     if pretrain_status == "trained":
-        x = np.asarray([state_features(prefixes[row["state_id"]]["state"]) for row in labels], dtype="float32")
+        x = np.asarray([
+            state_features(prefixes[row["state_id"]]["state"], feature_version=feature_version) for row in labels
+        ], dtype="float32")
         y = np.asarray([_action_index(float(row["default_action"]), actions) for row in labels], dtype="int64")
         for _ in range(pretrain_epochs):
             for indices in _batch_indices(len(x), batch_size, rng):
@@ -203,9 +260,12 @@ def train_policy(
                 optimizer.update(online.gradients(x[indices], hidden, grad))
         target.copy_from(online)
 
-    x = np.asarray([state_features(prefixes[row["state_id"]]["state"]) for row in transitions], dtype="float32")
+    x = np.asarray([
+        state_features(prefixes[row["state_id"]]["state"], feature_version=feature_version) for row in transitions
+    ], dtype="float32")
     next_x = np.asarray([
-        state_features(prefixes[row["next_state_id"]]["state"]) if row.get("next_state_id") else [0.0] * input_dim
+        state_features(prefixes[row["next_state_id"]]["state"], feature_version=feature_version)
+        if row.get("next_state_id") else [0.0] * input_dim
         for row in transitions
     ], dtype="float32")
     action_index = np.asarray([_action_index(float(row["action"]), actions) for row in transitions], dtype="int64")
@@ -215,6 +275,31 @@ def train_policy(
     if not np.all(np.isfinite(sample_weights)) or np.any(sample_weights <= 0):
         raise ValueError("transition sample_weight must be finite and positive")
     losses: list[float] = []
+    best_network: MLP | None = None
+    best_epoch: int | None = None
+    best_dev_reward: float | None = None
+    best_dev_quality: float | None = None
+    best_dev_injected_tokens: float | None = None
+    dev_state_ids = sorted({str(row["state_id"]) for row in dev_transitions})
+    dev_lookup = {
+        (str(row["state_id"]), _action_index(float(row["action"]), actions)): row
+        for row in dev_transitions
+    }
+    if select_best_dev and not dev_state_ids:
+        raise ValueError("select_best_dev requires training-eligible dev transitions")
+    if select_best_dev:
+        missing = [
+            (state_id, action)
+            for state_id in dev_state_ids
+            for action in range(len(actions))
+            if (state_id, action) not in dev_lookup
+        ]
+        if missing:
+            raise ValueError(f"dev transitions do not cover the fixed action table: {missing[0]}")
+        dev_x = np.asarray(
+            [state_features(prefixes[state_id]["state"], feature_version=feature_version) for state_id in dev_state_ids],
+            dtype="float32",
+        )
 
     for epoch in range(cql_epochs):
         for indices in _batch_indices(len(x), batch_size, rng):
@@ -238,12 +323,45 @@ def train_policy(
             ))
         if (epoch + 1) % 10 == 0:
             target.copy_from(online)
+        if select_best_dev:
+            dev_q, _ = online.forward(dev_x)
+            selected = dev_q.argmax(axis=1)
+            selected_rows = [
+                dev_lookup[(state_id, int(action))]
+                for state_id, action in zip(dev_state_ids, selected, strict=True)
+            ]
+            dev_reward = float(np.mean([float(row["reward"]) for row in selected_rows]))
+            dev_quality = float(np.mean([
+                float(row.get("quality_reward", row["reward"])) for row in selected_rows
+            ]))
+            dev_injected_tokens = float(np.mean([
+                float(row.get("injected_tokens", 0)) for row in selected_rows
+            ]))
+            is_better = (
+                best_dev_reward is None
+                or dev_reward > best_dev_reward + 1e-12
+                or (
+                    abs(dev_reward - best_dev_reward) <= 1e-12
+                    and (best_dev_injected_tokens is None or dev_injected_tokens < best_dev_injected_tokens)
+                )
+            )
+            if is_better:
+                if best_network is None:
+                    best_network = MLP(input_dim, hidden_dim, len(actions), seed + 2)
+                best_network.copy_from(online)
+                best_epoch = epoch + 1
+                best_dev_reward = dev_reward
+                best_dev_quality = dev_quality
+                best_dev_injected_tokens = dev_injected_tokens
+
+    if best_network is not None:
+        online.copy_from(best_network)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     weights = {
         "schema_version": 1,
         "model_type": "one-hidden-layer-relu-q-network",
-        "feature_version": FEATURE_VERSION,
+        "feature_version": feature_version,
         "numeric_keys": list(NUMERIC_KEYS),
         "hash_dim": HASH_DIM,
         "actions": list(actions),
@@ -260,14 +378,21 @@ def train_policy(
         "action_table_version": manifest.get("action_table_version"),
         "allocator_version": manifest.get("allocator_version"),
         "tokenizer_version": manifest.get("tokenizer_version"),
-        "feature_version": FEATURE_VERSION,
+        "feature_version": feature_version,
         "pretrain_status": pretrain_status,
         "training_transitions": len(transitions),
         "training_weight_sum": float(sample_weights.sum()),
+        "dev_transitions": len(dev_transitions),
+        "dev_states": len(dev_state_ids),
+        "selected_epoch": best_epoch if best_epoch is not None else cql_epochs,
+        "selection_metric": "dev-policy-mean-reward-then-min-injected-tokens" if select_best_dev else "final-epoch",
+        "best_dev_policy_reward": best_dev_reward,
+        "best_dev_policy_quality": best_dev_quality,
+        "best_dev_policy_mean_injected_tokens": best_dev_injected_tokens,
         "hyperparameters": {
             "hidden_dim": hidden_dim, "seed": seed, "pretrain_epochs": pretrain_epochs,
             "cql_epochs": cql_epochs, "batch_size": batch_size, "learning_rate": learning_rate,
-            "cql_alpha": cql_alpha, "gamma": gamma,
+            "cql_alpha": cql_alpha, "gamma": gamma, "select_best_dev": select_best_dev,
         },
         "final_mean_loss": sum(losses[-max(1, min(len(losses), 20)):]) / max(1, min(len(losses), 20)),
     }

@@ -50,6 +50,7 @@ def export_longmemeval_training(
     split_seed: str = "longmemeval-v1",
     question_ids_file: Path | None = None,
     limit: int | None = None,
+    include_action_features: bool = False,
 ) -> dict[str, Any]:
     if cost_coefficient < 0:
         raise ValueError("cost_coefficient must be non-negative")
@@ -85,6 +86,23 @@ def export_longmemeval_training(
         question_id = str(state_payload["question_id"])
         if selected_question_ids is not None and question_id not in selected_question_ids:
             continue
+        samples = _read_jsonl(item_dir / "samples.jsonl")
+        if include_action_features:
+            action_features: dict[float, tuple[int, int, int]] = {}
+            for sample in samples:
+                feature = (
+                    int(sample.get("budget_tokens") or 0),
+                    int(sample.get("injected_tokens") or 0),
+                    len(sample.get("selected_l1_ids") or []),
+                )
+                for alias in sample.get("action_aliases", [sample["action"]]):
+                    action_features[float(alias)] = feature
+            missing_actions = [action for action in actions if action not in action_features]
+            if missing_actions:
+                raise ValueError(f"item {question_id} lacks action-plan features for {missing_actions[0]}")
+            state_payload["action_budget_tokens"] = [action_features[action][0] for action in actions]
+            state_payload["action_injected_tokens"] = [action_features[action][1] for action in actions]
+            state_payload["action_selected_l1_counts"] = [action_features[action][2] for action in actions]
         split = split_for_question(question_id, seed=split_seed)
         states.append({"state_id": state_id, "task_id": question_id, "split": split, "state": state_payload})
         labels.append({
@@ -96,7 +114,7 @@ def export_longmemeval_training(
             "label_source": "beta1-openclaw-full-top5",
             "label_semantics": "behavior-imitation-not-optimal-action",
         })
-        for sample in _read_jsonl(item_dir / "samples.jsonl"):
+        for sample in samples:
             usage = sample.get("answer_usage") or {}
             billable_tokens = (
                 float(usage.get("input_tokens") or 0)
@@ -166,6 +184,7 @@ def export_longmemeval_training(
         "cost_coefficient": cost_coefficient,
         "cost_normalizer_tokens": cost_normalizer_tokens,
         "cost_measure": cost_measure,
+        "state_action_features": "budget-injected-selected-counts-v1" if include_action_features else "none",
         "judge_model": source_manifest.get("judge_model"),
         "judge_protocol": source_manifest.get("judge_protocol"),
         "split_seed": split_seed,
