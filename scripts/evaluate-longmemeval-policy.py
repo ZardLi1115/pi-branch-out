@@ -62,6 +62,13 @@ def evaluate(dataset: Path, policy_dir: Path) -> dict[str, Any]:
             "policy_mean_action": mean([float(row["action"]) for row in policy_rows]),
             "policy_mean_injected_tokens": mean([float(row["injected_tokens"]) for row in policy_rows]),
             "fixed_quality": {str(action): mean(values) for action, values in sorted(fixed.items())},
+            "fixed_mean_injected_tokens": {
+                str(action): mean([
+                    float(transitions[state_row["state_id"]][action]["injected_tokens"])
+                    for state_row in state_rows
+                ])
+                for action in sorted(fixed)
+            },
             "oracle_quality": mean([
                 max(float(row["quality_reward"]) for row in transitions[state_row["state_id"]].values())
                 for state_row in state_rows

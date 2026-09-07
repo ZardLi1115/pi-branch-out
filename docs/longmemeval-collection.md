@@ -109,8 +109,23 @@ python scripts/export-longmemeval-training.py `
 导出器按 question ID 稳定切分 80/10/10，生成现有 CQL trainer 可读的
 `state-prefixes.jsonl`、`default-labels.jsonl`、`transitions.jsonl` 和
 `equivalent-action-aliases.jsonl`。默认 `reward` 是 LongMemEval 二元质量分；可显式
-传 `--cost-coefficient` 加入基于回答账单 Token 的成本惩罚，judge 用量始终只算研究
-开销。
+传 `--cost-coefficient` 加入成本惩罚。`--cost-measure answer-billable-token-proxy`
+使用回答调用的输入（扣缓存读）加输出 Token；`--cost-measure injected-l1-tokens`
+只惩罚预算动作实际新增的 L1 Token。judge 用量始终只算研究开销。
+
+要按固定 selection 前缀重建 n200 并扫描 L1 Token 成本系数，可运行：
+
+```powershell
+pwsh -File scripts/run-longmemeval-cost-sweep.ps1 `
+  -Limit 200 `
+  -CostCoefficients 0,0.1,0.3,1.0 `
+  -CostNormalizerTokens 100 `
+  -Seeds 7,17,29
+```
+
+该脚本只读取已完成的采集结果，不重新调用 answer/judge API。各 cost coefficient 使用
+独立 training/policy 目录，不覆盖完整 n500 数据。selection 文件与 limit 会写入 manifest，
+保证子集成员可以复核。
 
 `default-labels.jsonl` 中的 1.0 只表示 beta.1 OpenClaw 默认会注入完整 top-5，
 是行为模仿标签，不表示该动作是该题的最优预算。实际 Q 值只从已执行并评分的
@@ -136,7 +151,8 @@ python scripts/evaluate-longmemeval-policy.py `
 
 50 题阶段的 dev/test 仍太小，结果只用于训练接线验收，不用于替换默认策略。
 评估同时报告 `all` 与 `informative`：后者只包含至少两个 action 获得不同质量分的
-state，防止全档同分题让任意策略看起来同样优秀。
+state，防止全档同分题让任意策略看起来同样优秀。固定预算除质量外还报告平均
+L1 注入 Token，便于按预先确定的质量容忍范围比较成本，而不是只按准确率选策略。
 
 beta.1 的 `conversation/add` 没有幂等键，因此写入请求绝不自动重试。若响应结果
 不确定，item 会写 `ingest-uncertain.json` 并隔离失败；必须换新 batch/namespace，

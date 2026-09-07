@@ -28,11 +28,13 @@ def test_longmemeval_export_preserves_paired_actions_and_aliases(tmp_path: Path)
         json.dumps({
             "effective_action_id": "sha256:empty", "action": 0,
             "action_aliases": [0, 0.5], "reward": 0,
+            "injected_tokens": 0,
             "answer_usage": {"input_tokens": 100, "cache_read_tokens": 80, "output_tokens": 10},
         }),
         json.dumps({
             "effective_action_id": "sha256:full", "action": 1,
             "action_aliases": [1], "reward": 1,
+            "injected_tokens": 40,
             "answer_usage": {"input_tokens": 150, "cache_read_tokens": 100, "output_tokens": 10},
         }),
     ]) + "\n", encoding="utf-8")
@@ -49,6 +51,48 @@ def test_longmemeval_export_preserves_paired_actions_and_aliases(tmp_path: Path)
     assert labels[0]["default_action"] == 1.0
     assert labels[0]["allocator_content_match"] is True
     assert manifest["unique_states"] == 1
+
+
+def test_longmemeval_export_can_use_injected_l1_cost_and_stable_subset(tmp_path: Path) -> None:
+    root = tmp_path / "collection"
+    for question_id, injected_tokens in (("q1", 25), ("q2", 75)):
+        item = root / "items" / question_id
+        item.mkdir(parents=True)
+        _json(item / "complete.json", {"status": "complete"})
+        _json(item / "state.json", {"state_id": f"s-{question_id}", "question_id": question_id})
+        (item / "samples.jsonl").write_text(json.dumps({
+            "effective_action_id": f"sha256:{question_id}",
+            "action": 1,
+            "action_aliases": [1],
+            "reward": 1,
+            "injected_tokens": injected_tokens,
+            "answer_usage": {"input_tokens": 1000, "output_tokens": 100},
+        }) + "\n", encoding="utf-8")
+    _json(root / "dataset-manifest.json", {
+        "schema_version": "collection-v1",
+        "action_ratios": [1],
+    })
+    selection = tmp_path / "selection.json"
+    _json(selection, {"question_ids": ["q2", "q1"]})
+
+    output = tmp_path / "training"
+    manifest = export_longmemeval_training(
+        root,
+        output,
+        cost_coefficient=0.5,
+        cost_normalizer_tokens=100,
+        cost_measure="injected-l1-tokens",
+        question_ids_file=selection,
+        limit=1,
+    )
+    transitions = [json.loads(line) for line in (output / "transitions.jsonl").read_text().splitlines()]
+    assert len(transitions) == 1
+    assert transitions[0]["task_id"] == "q2"
+    assert transitions[0]["normalized_cost"] == 0.75
+    assert transitions[0]["reward"] == 0.625
+    assert manifest["unique_states"] == 1
+    assert manifest["cost_measure"] == "injected-l1-tokens"
+    assert manifest["question_ids_limit"] == 1
 
 
 def test_longmemeval_split_is_stable() -> None:

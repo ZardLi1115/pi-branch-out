@@ -46,14 +46,32 @@ def export_longmemeval_training(
     *,
     cost_coefficient: float = 0.0,
     cost_normalizer_tokens: float = 10_000.0,
+    cost_measure: str = "answer-billable-token-proxy",
     split_seed: str = "longmemeval-v1",
+    question_ids_file: Path | None = None,
+    limit: int | None = None,
 ) -> dict[str, Any]:
     if cost_coefficient < 0:
         raise ValueError("cost_coefficient must be non-negative")
     if cost_normalizer_tokens <= 0:
         raise ValueError("cost_normalizer_tokens must be positive")
+    if cost_measure not in {"answer-billable-token-proxy", "injected-l1-tokens"}:
+        raise ValueError(f"unsupported cost_measure: {cost_measure}")
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive")
     source_manifest = _read_json(collection_root / "dataset-manifest.json")
     actions = [float(value) for value in source_manifest["action_ratios"]]
+    selected_question_ids: set[str] | None = None
+    if question_ids_file is not None:
+        selection = _read_json(question_ids_file)
+        question_ids = [str(value) for value in selection.get("question_ids", [])]
+        if not question_ids:
+            raise ValueError(f"selection has no question_ids: {question_ids_file}")
+        if len(question_ids) != len(set(question_ids)):
+            raise ValueError(f"selection contains duplicate question_ids: {question_ids_file}")
+        selected_question_ids = set(question_ids[:limit] if limit is not None else question_ids)
+    elif limit is not None:
+        raise ValueError("limit requires question_ids_file so the subset order is explicit")
     states: list[dict[str, Any]] = []
     labels: list[dict[str, Any]] = []
     transitions: list[dict[str, Any]] = []
@@ -65,6 +83,8 @@ def export_longmemeval_training(
         state_payload = _read_json(item_dir / "state.json")
         state_id = str(state_payload.pop("state_id"))
         question_id = str(state_payload["question_id"])
+        if selected_question_ids is not None and question_id not in selected_question_ids:
+            continue
         split = split_for_question(question_id, seed=split_seed)
         states.append({"state_id": state_id, "task_id": question_id, "split": split, "state": state_payload})
         labels.append({
@@ -83,7 +103,9 @@ def export_longmemeval_training(
                 - float(usage.get("cache_read_tokens") or 0)
                 + float(usage.get("output_tokens") or 0)
             )
-            normalized_cost = max(0.0, billable_tokens) / cost_normalizer_tokens
+            injected_tokens = max(0, int(sample.get("injected_tokens") or 0))
+            cost_tokens = billable_tokens if cost_measure == "answer-billable-token-proxy" else injected_tokens
+            normalized_cost = max(0.0, cost_tokens) / cost_normalizer_tokens
             quality_reward = float(sample["reward"])
             reward = quality_reward - cost_coefficient * normalized_cost
             action_aliases = [float(value) for value in sample.get("action_aliases", [sample["action"]])]
@@ -101,7 +123,7 @@ def export_longmemeval_training(
                     "normalized_cost": normalized_cost,
                     "billable_token_proxy": billable_tokens,
                     "budget_tokens": int(sample.get("budget_tokens") or 0),
-                    "injected_tokens": int(sample.get("injected_tokens") or 0),
+                    "injected_tokens": injected_tokens,
                     "usage": usage,
                     "done": True,
                     "truncated": False,
@@ -143,7 +165,7 @@ def export_longmemeval_training(
         "tdai_version": source_manifest.get("tdai_version"),
         "cost_coefficient": cost_coefficient,
         "cost_normalizer_tokens": cost_normalizer_tokens,
-        "cost_measure": "answer-input-minus-cache-read-plus-output-token-proxy",
+        "cost_measure": cost_measure,
         "judge_model": source_manifest.get("judge_model"),
         "judge_protocol": source_manifest.get("judge_protocol"),
         "split_seed": split_seed,
@@ -158,6 +180,9 @@ def export_longmemeval_training(
         ),
         "equivalent_action_aliases": len(aliases),
     }
+    if question_ids_file is not None:
+        manifest["question_ids_file"] = str(question_ids_file.resolve())
+        manifest["question_ids_limit"] = limit
     fingerprint_payload = json.dumps(manifest, sort_keys=True, ensure_ascii=False)
     manifest["dataset_sha256"] = hashlib.sha256(fingerprint_payload.encode()).hexdigest()
     _write_json(output_dir / "dataset-manifest.json", manifest)
