@@ -6,11 +6,13 @@ param(
     [string]$Model = "gpt-5.6-luna",
     [string]$CoreImage = "tdai-memory-core-local:v2.0.0-beta.1",
     [string]$ProxyImage = "tdai-memory-proxy-local:v2.0.0-beta.1",
+    [string]$TdaiVersion = "v2.0.0-beta.1",
     [ValidateSet("code", "chat")][string]$PromptMode = "code",
     [int]$L1IdleTimeoutSeconds = 600,
     [int]$L2DelayAfterL1Seconds = 90,
     [int]$L2MinIntervalSeconds = 900,
     [int]$L2MaxIntervalSeconds = 3600,
+    [switch]$DisableInjection,
     [switch]$Recreate
 )
 
@@ -234,6 +236,7 @@ if ($taskId) {
 }
 
 $proxyConfig = Join-Path $stateRoot "proxy.yaml"
+$injectionEnabled = if ($DisableInjection) { "false" } else { "true" }
 $proxyYaml = @"
 server:
   host: 0.0.0.0
@@ -257,10 +260,10 @@ tdai:
   serviceId: default
   memory:
     enabled: true
-    inject: true
-    writeL0: true
-    recallL1: true
-    injectL2L3: true
+    inject: $injectionEnabled
+    writeL0: $(-not $DisableInjection)
+    recallL1: $injectionEnabled
+    injectL2L3: $injectionEnabled
     l1Limit: 36
     l2Limit: 3
     timeoutMs: 5000
@@ -278,8 +281,8 @@ auth:
 sessionInit:
   enabled: true
   maxRetries: 3
-  injectAgentContext: true
-  injectTaskContext: true
+  injectAgentContext: $injectionEnabled
+  injectTaskContext: $injectionEnabled
   headerAutoSelect:
     enabled: true
     teamHeader: "x-team-id"
@@ -287,10 +290,10 @@ sessionInit:
     taskHeader: "x-task-id"
     onMismatch: "form"
 injection:
-  enabled: true
+  enabled: $injectionEnabled
   injectors: [tdai-memory]
 extraction:
-  enabled: true
+  enabled: $(-not $DisableInjection)
   extractors: [tdai-memory]
 storage:
   enabled: true
@@ -327,7 +330,8 @@ $runtime = @{
     TDAI_SPACE_ID = "default"
     TDAI_AGENT_SOURCE = "codebuddy"
     TDAI_WIRE_API = "chat-completions"
-    TDAI_VERSION = "v2.0.0-beta.1"
+    TDAI_VERSION = $TdaiVersion
+    TDAI_INJECTION_DISABLED = [bool]$DisableInjection
     TDAI_TEAM_ID = $teamId
     TDAI_AGENT_ID = $agentId
     TDAI_TASK_ID = $taskId
